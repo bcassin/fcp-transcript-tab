@@ -70,6 +70,10 @@ SpliceKit-patched copy of Final Cut Pro.
 4. Quit and reopen the SpliceKit-patched Final Cut Pro. Select a clip, then click the new tab in
    the inspector.
 
+If you skipped step 3, macOS shows a "TranscriptTab.dylib Not Opened" prompt when Final Cut Pro
+starts. Click **Done** (not Move to Trash), quit Final Cut Pro, run the command from step 3, and
+open it again.
+
 ### Install from source
 
 ```bash

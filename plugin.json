@@ -1,0 +1,10 @@
+{
+  "id": "com.innerparakeet.transcript-tab",
+  "name": "Transcript Tab",
+  "version": "1.0.0",
+  "description": "Premiere-style text-based editing as a Transcript tab in the Final Cut Pro inspector",
+  "author": "Inner Parakeet",
+  "apiVersion": 1,
+  "entry": { "native": "TranscriptTab.dylib" },
+  "dependencies": []
+}

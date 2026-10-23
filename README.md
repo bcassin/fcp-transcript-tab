@@ -57,7 +57,7 @@ SpliceKit-patched copy of Final Cut Pro.
 
 ## Install
 
-1. Download `TranscriptTab-1.0.0.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `TranscriptTab-1.1.0.zip` from the [Releases](../../releases) page and unzip it.
    You get a folder called `com.innerparakeet.transcript-tab`.
 2. Move that folder into SpliceKit's plugins folder:
    `~/Library/Application Support/SpliceKit/plugins/`

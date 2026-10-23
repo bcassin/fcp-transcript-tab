@@ -23,14 +23,23 @@ static void TLog(NSString *fmt, ...) {
 - (NSView *)view;
 @end
 
-static CMTimeRange SKTimeRange(id obj) {
-    CMTimeRange r = kCMTimeRangeZero;
-    SEL sel = NSSelectorFromString(@"timeRange");
+// Does `obj` answer `sel` with a CMTimeRange? Checked once per (class, selector) with the method
+// signature, then called directly through objc_msgSend (arm64 returns the 48-byte struct through
+// the same entry point). This replaced an NSInvocation per call, which dominated refresh time.
+static BOOL SKReturnsRange(id obj, SEL sel) {
+    struct SKRangeCacheEntry { Class cls; SEL sel; BOOL ok; };
+    static struct SKRangeCacheEntry cache[48]; static int n;
+    Class c = object_getClass(obj);
+    for (int i = 0; i < n; i++) if (cache[i].cls == c && cache[i].sel == sel) return cache[i].ok;
     NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    if (!sig || sig.methodReturnLength != sizeof(CMTimeRange)) return r;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = obj; inv.selector = sel; [inv invoke]; [inv getReturnValue:&r];
-    return r;
+    BOOL ok = sig && sig.methodReturnLength == sizeof(CMTimeRange);
+    if (n < 48) { cache[n].cls = c; cache[n].sel = sel; cache[n].ok = ok; n++; }
+    return ok;
+}
+static CMTimeRange SKTimeRange(id obj) {
+    static SEL sel; if (!sel) sel = NSSelectorFromString(@"timeRange");
+    if (!SKReturnsRange(obj, sel)) return kCMTimeRangeZero;
+    return ((CMTimeRange(*)(id,SEL))objc_msgSend)(obj, sel);
 }
 
 // One rendered word: where it sits in the text view, in the source media and on the timeline.
@@ -127,8 +136,10 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic, strong) NSButton *fillerButton, *pauseButton;
 @property (nonatomic) BOOL built;
 @property (nonatomic) NSUInteger tickCount;
-@property (nonatomic, copy) NSString *renderedSignature;
+@property (nonatomic, copy) NSString *renderedSignature, *renderedKey;
+@property (nonatomic) BOOL needsRefresh, refreshQueued;   // coalesced, visible-only redraws
 - (void)sk_refresh;
+- (void)sk_requestRefresh;
 - (BOOL)sk_deleteAllFillers:(BOOL)fillers;
 - (NSArray<SKWord *> *)sk_selectedWords;
 - (void)sk_rebuildSpeakerMenus:(NSArray<NSString *> *)names;
@@ -210,12 +221,8 @@ static void SKTimelineAction(NSString *selName) {
 
 static BOOL SKInvokeRange(id obj, NSString *selName, id arg, CMTimeRange *out) {
     SEL sel = NSSelectorFromString(selName);
-    NSMethodSignature *sig = [obj methodSignatureForSelector:sel];
-    if (!sig || sig.methodReturnLength != sizeof(CMTimeRange)) return NO;
-    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-    inv.target = obj; inv.selector = sel;
-    if (arg) [inv setArgument:&arg atIndex:2];
-    [inv invoke]; [inv getReturnValue:out];
+    if (!SKReturnsRange(obj, sel)) return NO;
+    *out = ((CMTimeRange(*)(id,SEL,id))objc_msgSend)(obj, sel, arg);
     return YES;
 }
 
@@ -365,7 +372,7 @@ static NSArray<NSDictionary *> *SKConnectedOverGaps(NSArray *primary, NSArray<NS
 // The FCP proxy file for an asset, if FCP has one on disk. Proxies keep every audio channel and
 // the original's timing, and are a fraction of the size, so audio comes out of them far faster
 // (39 min: ~7 s from the proxy vs ~145 s from a 4K MXF on the same drive).
-static NSString *SKProxyPath(id asset) {
+static NSString *SKProxyPathUncached(id asset) {
     @try {
         SEL avail = NSSelectorFromString(@"proxyAvailable"), rep = NSSelectorFromString(@"proxyMediaRep");
         if (![asset respondsToSelector:avail] || !((BOOL(*)(id,SEL))objc_msgSend)(asset, avail) || ![asset respondsToSelector:rep]) return nil;
@@ -374,6 +381,17 @@ static NSString *SKProxyPath(id asset) {
         NSString *path = [url.path stringByResolvingSymlinksInPath];
         return path && [[NSFileManager defaultManager] fileExistsAtPath:path] ? path : nil;
     } @catch (id e) { return nil; }
+}
+
+static NSString *SKProxyPath(id asset) {
+    static NSMapTable *cache; static CFAbsoluteTime born;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!cache || now - born > 900) { cache = [NSMapTable strongToStrongObjectsMapTable]; born = now; }
+    id hit = [cache objectForKey:asset];
+    if (hit) return [hit isKindOfClass:[NSNull class]] ? nil : hit;
+    NSString *p = SKProxyPathUncached(asset);
+    [cache setObject:p ?: (id)[NSNull null] forKey:asset];
+    return p;
 }
 
 static NSArray *SKAssetsForItem(id item) {
@@ -403,6 +421,45 @@ static id SKTranscriptForAsset(id asset) {
     return nil;
 }
 
+// A short-lived cache of each asset's words (and media / proxy paths). Fetching FCP's stored
+// transcript and walking it through KVC for every refresh was the bulk of a refresh. Only
+// transcripts WITH words are cached (a missing one is re-checked every time, so the Transcribe flow
+// sees it appear at once); everything expires after 15 min, and a finished transcription clears it.
+@interface SKRawWord : NSObject
+@property (nonatomic, copy) NSString *text;
+@property (nonatomic) double s, e;
+@end
+@implementation SKRawWord
+@end
+static NSMapTable *gPhraseCache;       // asset -> NSArray<NSArray<SKRawWord *> *>
+static CFAbsoluteTime gPhraseCacheBorn;
+static void SKClearAssetCaches(void) { gPhraseCache = nil; }
+static NSArray<NSArray<SKRawWord *> *> *SKPhrasesForAsset(id asset) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!gPhraseCache || now - gPhraseCacheBorn > 900) { gPhraseCache = [NSMapTable strongToStrongObjectsMapTable]; gPhraseCacheBorn = now; }
+    NSArray *hit = [gPhraseCache objectForKey:asset];
+    if (hit) return hit;
+    id transcript = SKTranscriptForAsset(asset);
+    if (!transcript) return nil;
+    NSMutableArray *phrases = [NSMutableArray array];
+    for (id phrase in (NSArray *)[transcript valueForKey:@"phrases"]) {
+        NSArray *pw = [phrase valueForKey:@"words"];
+        if (![pw isKindOfClass:[NSArray class]]) continue;
+        NSMutableArray *list = [NSMutableArray arrayWithCapacity:pw.count];
+        for (id w in pw) {
+            NSString *t = [[w valueForKey:@"text"] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if (!t.length) continue;
+            CMTimeRange tr = SKTimeRange(w);
+            SKRawWord *rw = [SKRawWord new];
+            rw.text = t; rw.s = CMTimeGetSeconds(tr.start); rw.e = rw.s + CMTimeGetSeconds(tr.duration);
+            [list addObject:rw];
+        }
+        [phrases addObject:list];
+    }
+    [gPhraseCache setObject:phrases forKey:asset];
+    return phrases;
+}
+
 // Browser clips (event clips) whose media is one of `assets`, across all open libraries.
 // Analyze and Fix works on browser clips, so a project or timeline clip is transcribed through
 // the browser clip of the same media — what you'd select by hand.
@@ -422,6 +479,7 @@ static NSArray *SKBrowserClipsForAssets(NSArray *assets) {
 }
 
 static void SKRefreshModule(void);
+static void SKClearAssetCaches(void);
 // Every 2 s: redraw as transcripts land in FCP's store. If FCP has no transcription task running
 // for 15 s and some are still missing, mark those as failed so the panel can offer Try again.
 static void SKPollTranscription(NSArray *assets, CFAbsoluteTime started) {
@@ -438,7 +496,7 @@ static void SKPollTranscription(NSArray *assets, CFAbsoluteTime started) {
             if (SKTranscriptForAsset(a)) { [gTranscribeState removeObjectForKey:a]; done++; }
             else [pending addObject:a];
         }
-        if (done) { TLog(@"transcribe: %lu transcript(s) stored by FCP", (unsigned long)done); SKRefreshModule(); }
+        if (done) { TLog(@"transcribe: %lu transcript(s) stored by FCP", (unsigned long)done); SKClearAssetCaches(); SKRefreshModule(); }
         if (!pending.count) return;
         if (!busy && idleFor > 15) {
             TLog(@"transcribe: FCP idle with %lu asset(s) still untranscribed after %.0fs", (unsigned long)pending.count, now - started);
@@ -510,7 +568,7 @@ static NSMutableDictionary *SKSpeakerEntry(NSString *path, BOOL create) {
 // The media file behind an asset, with symlinks resolved. Each library reaches an external
 // file through its own link (…/Library.fcpbundle/Event/Original Media/clip.mxf), so the real
 // path is what lets speaker labels and corrections follow a clip between libraries.
-static NSString *SKMediaPath(id asset) {
+static NSString *SKMediaPathUncached(id asset) {
     for (NSString *keyPath in @[@"resolvedURL", @"originalMediaURL", @"URL", @"assetMediaReference.resolvedURL", @"media.originalMediaURL", @"originalMediaRep.URL"]) {
         @try {
             id v = [asset valueForKeyPath:keyPath];
@@ -518,6 +576,17 @@ static NSString *SKMediaPath(id asset) {
         } @catch (id e) {}
     }
     return nil;
+}
+// Cached for 60 s (a failed key path throws, and the symlink resolution hits the disk).
+static NSString *SKMediaPath(id asset) {
+    static NSMapTable *cache; static CFAbsoluteTime born;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!cache || now - born > 900) { cache = [NSMapTable strongToStrongObjectsMapTable]; born = now; }
+    id hit = [cache objectForKey:asset];
+    if (hit) return [hit isKindOfClass:[NSNull class]] ? nil : hit;
+    NSString *p = SKMediaPathUncached(asset);
+    [cache setObject:p ?: (id)[NSNull null] forKey:asset];
+    return p;
 }
 
 // Speaker ID at a source time: manual overrides first, then the detected word nearest in time.
@@ -1336,7 +1405,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
 - (void)setCurrentItems:(id)items {
     @try { [super setCurrentItems:items]; } @catch (id e) { TLog(@"super setCurrentItems threw %@", e); }
     [self sk_build];
-    [self sk_refresh];
+    [self sk_requestRefresh];
 }
 
 #pragma mark Rendering
@@ -1351,6 +1420,40 @@ static BOOL SKIsFiller(NSString *text) {
     return [fillers containsObject:[[text lowercaseString] stringByTrimmingCharactersInSet:strip]];
 }
 
+// Redraw requests from FCP events (selection changes, inspector show/hide) are coalesced into
+// one per run-loop turn, and the (expensive) rebuild only happens while the tab is on screen. If it
+// isn't, the request is remembered and sk_tick draws when the tab appears.
+- (BOOL)sk_isShowing {
+    NSView *v = self.container;
+    BOOL showing = v.window && v.window.isVisible && !v.isHiddenOrHasHiddenAncestor;
+    static int last = -1;
+    if (last != (int)showing) { last = showing; TLog(@"showing=%d", showing); }
+    return showing;
+}
+// Everything that decides what a refresh would draw, except what user actions change (those call
+// sk_refresh directly). Selecting any clips of the primary storyline draws the same whole-timeline
+// text, so they share one key.
+- (NSString *)sk_renderKeyWithSignature:(NSString *)sig {
+    NSArray *items = gItems, *primary = SKPrimaryItems();
+    BOOL seq = items.count && primary.count;
+    for (id it in items) if (![primary containsObject:it]) { seq = NO; break; }
+    NSMutableString *k = [NSMutableString string];
+    if (seq) [k appendString:@"SEQ"]; else for (id it in items) [k appendFormat:@"%p,", it];
+    [k appendFormat:@"|%@|%@|%.3f|%ld|%d|%g|%.0f", sig, gSpeakerFilter ?: @"", gPauseThreshold, (long)SKTimecodeMode(), SKColorBars(), SKTextScale(), gPhraseCacheBorn];
+    return k;
+}
+- (void)sk_requestRefresh {
+    self.needsRefresh = YES;
+    if (self.refreshQueued) return;
+    self.refreshQueued = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.refreshQueued = NO;
+        if (!(self.needsRefresh && [self sk_isShowing])) return;
+        if (self.words.count && self.renderedKey && [[self sk_renderKeyWithSignature:SKTimelineSignature()] isEqualToString:self.renderedKey]) { self.needsRefresh = NO; return; }   // nothing that matters changed
+        [self sk_refresh];
+    });
+}
+
 // Rebuild the text. If the selection is in the primary storyline we show the whole
 // timeline's transcript (every primary clip, trimmed-out words omitted) with words mapped
 // to timeline time, fillers tinted, silences of at least gPauseThreshold shown as
@@ -1359,6 +1462,8 @@ static BOOL SKIsFiller(NSString *text) {
 // browser clip) we show that clip's source transcript.
 - (void)sk_refresh {
     if (!self.textView) return;
+    self.needsRefresh = NO;
+    CFAbsoluteTime tRefresh0 = CFAbsoluteTimeGetCurrent();
     SKLoadSpeakers();
     NSArray *items = gItems;
     NSDictionary *body = @{NSFontAttributeName: [NSFont systemFontOfSize:SKPt(13)], NSForegroundColorAttributeName: [NSColor labelColor]};
@@ -1468,8 +1573,8 @@ static BOOL SKIsFiller(NSString *text) {
             NSArray *assets = SKAssetsForItem(clip);
             if (assets.count == 0) continue;   // gaps, generators: their time shows up as a pause
             for (id asset in assets) {
-                id transcript = SKTranscriptForAsset(asset);
-                if (!transcript) { [missingAssets addObject:asset]; if (![missingClips containsObject:clip]) [missingClips addObject:clip]; continue; }
+                NSArray<NSArray<SKRawWord *> *> *rawPhrases = SKPhrasesForAsset(asset);
+                if (!rawPhrases) { [missingAssets addObject:asset]; if (![missingClips containsObject:clip]) [missingClips addObject:clip]; continue; }
                 NSString *path = SKMediaPath(asset);
                 if (path) {
                     [mediaPaths addObject:path];
@@ -1477,14 +1582,11 @@ static BOOL SKIsFiller(NSString *text) {
                 }
                 NSDictionary *entry = SKSpeakerEntry(path, NO);
                 NSDictionary *corrections = [entry[@"corrections"] isKindOfClass:[NSDictionary class]] ? entry[@"corrections"] : nil;
-                for (id phrase in (NSArray *)[transcript valueForKey:@"phrases"]) {
-                    NSArray *pw = [phrase valueForKey:@"words"];
-                    if (![pw isKindOfClass:[NSArray class]]) continue;
+                for (NSArray<SKRawWord *> *pw in rawPhrases) {
                     BOOL opened = NO;
-                    for (id w in pw) {
-                        NSString *t = [[w valueForKey:@"text"] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]; if (!t.length) continue;
-                        CMTimeRange tr = SKTimeRange(w);
-                        double s = CMTimeGetSeconds(tr.start), e = s + CMTimeGetSeconds(tr.duration);
+                    for (SKRawWord *rw in pw) {
+                        NSString *t = rw.text;
+                        double s = rw.s, e = rw.e;
                         if (placed && (s < trimStart - 0.001 || s >= trimStart + clipDur - 0.001)) continue;   // trimmed away
                         SKWord *word = [SKWord new];
                         word.srcStart = s; word.srcEnd = e; word.mediaPath = path;
@@ -1610,12 +1712,25 @@ static BOOL SKIsFiller(NSString *text) {
     self.mediaPaths = mediaPaths.array;
     self.proxyPaths = proxies;
     self.renderedSignature = SKTimelineSignature();
+    self.renderedKey = [self sk_renderKeyWithSignature:self.renderedSignature];
+    NSRange oldHighlight = self.highlighted;
     self.highlighted = NSMakeRange(NSNotFound, 0);
     // A redraw that produces the same text (selection changes in the browser, timeline
     // polling) keeps the user's selection and any range already marked from it.
     BOOL sameText = [out.string isEqualToString:self.textView.string];
     NSRange keep = self.textView.selectedRange;
-    [self.textView.textStorage setAttributedString:out];
+    // When the rebuilt text is identical (inspector toggles, tab switches, re-selecting the same
+    // clip) keep the existing storage: replacing it throws away the glyphs and layout, which cost
+    // more than the rebuild itself. The playhead tint is not part of `out`, so lift it for the
+    // comparison; sk_tick puts it back.
+    CFAbsoluteTime tBuilt = CFAbsoluteTimeGetCurrent();
+    BOOL identical = NO;
+    if (sameText) {
+        NSTextStorage *ts = self.textView.textStorage;
+        if (oldHighlight.location != NSNotFound && NSMaxRange(oldHighlight) <= ts.length) [ts removeAttribute:NSBackgroundColorAttributeName range:oldHighlight];
+        identical = [ts isEqualToAttributedString:out];
+    }
+    if (!identical) [self.textView.textStorage setAttributedString:out];
     if (!self.colorPanel) { self.colorWheelButton.hidden = YES; self.hoverSpeaker = nil; }
     if (gRetryRange.location != NSNotFound && NSMaxRange(gRetryRange) <= out.length) {
         NSLayoutManager *lm = self.textView.layoutManager;
@@ -1641,6 +1756,7 @@ static BOOL SKIsFiller(NSString *text) {
     [self sk_rebuildSpeakerMenus:speakerNames.array];
     [self sk_updateFind:NO];
     [self sk_updateSourceButtons];
+    TLog(@"refresh took %.0f ms (build %.0f, same text=%d identical=%d)", (CFAbsoluteTimeGetCurrent() - tRefresh0) * 1000, (tBuilt - tRefresh0) * 1000, sameText, identical);
     [self sk_tick];
 }
 
@@ -2122,6 +2238,7 @@ static NSData *SKRun(NSString *tool, NSArray *args, int *status, void (^lineHand
 
 - (void)sk_highlight:(NSRange)range {
     if (NSEqualRanges(range, self.highlighted)) return;
+    { static int logged; if (logged++ < 30) TLog(@"highlight -> %lu,%lu", (unsigned long)range.location, (unsigned long)range.length); }
     NSTextStorage *ts = self.textView.textStorage;
     if (self.highlighted.location != NSNotFound && NSMaxRange(self.highlighted) <= ts.length)
         [ts removeAttribute:NSBackgroundColorAttributeName range:self.highlighted];
@@ -2150,7 +2267,8 @@ static NSString *SKTimelineSignature(void) {
 // the timeline was edited outside this tab (blade, trim, undo, appended clips…).
 - (void)sk_tick {
     if (self.tickCount % 3 == 0) [self sk_reattachIfNeeded];
-    if (!self.container.window || !self.container.window.isVisible) { self.tickCount++; return; }
+    if (![self sk_isShowing]) { self.tickCount++; return; }
+    if (self.needsRefresh) { [self sk_refresh]; return; }
     if (++self.tickCount % 5 == 0 && !SKTimelinePlaying()) {   // the timeline can't be edited mid-playback; keep the main thread free
         NSString *sig = SKTimelineSignature();
         if (self.renderedSignature && ![sig isEqualToString:self.renderedSignature]) { TLog(@"timeline changed, redrawing"); [self sk_refresh]; return; }
@@ -3009,7 +3127,7 @@ static BOOL h_ids(id self, SEL _cmd, id items, __autoreleasing id *outIds, __aut
             for (id it in snapshot) [desc addObject:[NSString stringWithFormat:@"%@ %p assets=%lu", [it class], it, (unsigned long)SKAssetsForItem(it).count]];
             TLog(@"items changed: %@", [desc componentsJoinedByString:@"; "]);
             gItems = snapshot;
-            dispatch_async(dispatch_get_main_queue(), ^{ [gModule sk_refresh]; });
+            [gModule sk_requestRefresh];
         }
         if (!r || !outIds || !outMap || !*outIds || !*outMap) return r;
         NSArray *ids = [*outIds isKindOfClass:[NSOrderedSet class]] ? [(NSOrderedSet *)*outIds array] : (NSArray *)*outIds;
@@ -3206,6 +3324,20 @@ static void SKInstallInspectorRestore(void) {
 static void SKInstallBrowseHook(void) {
     NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
     // SKTranscriptTestTranscribe: click the Transcribe / Try again button.
+    // SKTranscriptTestTab: "list" logs the inspector's tabs; "N" selects tab N (read-only; for benchmarking).
+    [nc addObserverForName:@"SKTranscriptTestTab" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+        @try {
+            NSTabView *tv = [gTabModule valueForKey:@"_tabView"];
+            NSString *cmd = [n.object description];
+            if ([cmd isEqualToString:@"list"]) {
+                for (NSUInteger i = 0; i < tv.tabViewItems.count; i++) { NSTabViewItem *it = tv.tabViewItems[i]; TLog(@"tab %lu: %@ id=%@%@", (unsigned long)i, it.label, [it.identifier class], it == tv.selectedTabViewItem ? @" (selected)" : @""); }
+            } else {
+                for (NSTabViewItem *it in tv.tabViewItems)   // by label ("Info"), or "transcript" for ours
+                    if ([cmd isEqualToString:@"transcript"] ? (it.identifier == gModule) : [it.label isEqualToString:cmd]) { ((void(*)(id,SEL,NSUInteger))objc_msgSend)(gTabModule, NSSelectorFromString(@"selectInspectorTab:"), [tv.tabViewItems indexOfObject:it]); return; }
+                TLog(@"test tab: no tab '%@'", cmd);
+            }
+        } @catch (id e) { TLog(@"test tab threw %@", e); }
+    }];
     [nc addObserverForName:@"SKTranscriptTestTranscribe" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         TLog(@"test transcribe: button %@", gModule.transcribeButton.hidden ? @"hidden" : @"clicked");
         if (!gModule.transcribeButton.hidden) [gModule.transcribeButton performClick:nil];
@@ -3266,5 +3398,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.0.0 loaded");
+    TLog(@"Transcript Tab 1.1.0 loaded");
 }

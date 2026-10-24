@@ -3133,6 +3133,13 @@ static BOOL h_ids(id self, SEL _cmd, id items, __autoreleasing id *outIds, __aut
         NSArray *ids = [*outIds isKindOfClass:[NSOrderedSet class]] ? [(NSOrderedSet *)*outIds array] : (NSArray *)*outIds;
         if ([ids containsObject:kTabIdent]) return r;
         if ([ids containsObject:@"FFInspectorTabLibraryPropertiesIdentifier"]) return r;
+        // Titles and other effects with their own inspector tab (Title/Text, identifier = the
+        // effect class, e.g. FFMotionEffect) lose those tabs, and Color, if a tab is added here, so
+        // leave the list alone for them. A title has no transcript anyway.
+        for (id k in ids) if ([k isKindOfClass:[NSString class]] && ![k hasPrefix:@"FFInspectorTab"]) {
+            static NSString *lastSkip; if (![k isEqual:lastSkip]) { lastSkip = k; TLog(@"no transcript tab for %@ (keeps its own tabs)", k); }
+            return r;
+        }
         NSMapTable *map = *outMap;
         id sample = [map objectForKey:ids.firstObject];
         id value;
@@ -3398,5 +3405,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.1.0 loaded");
+    TLog(@"Transcript Tab 1.1.1 loaded");
 }

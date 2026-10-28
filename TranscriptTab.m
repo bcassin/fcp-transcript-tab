@@ -25,7 +25,7 @@ static void TLog(NSString *fmt, ...) {
 
 // Does `obj` answer `sel` with a CMTimeRange? Checked once per (class, selector) with the method
 // signature, then called directly through objc_msgSend (arm64 returns the 48-byte struct through
-// the same entry point). This replaced an NSInvocation per call, which dominated refresh time.
+// the same entry point). v78: this replaced an NSInvocation per call, which dominated refresh time.
 static BOOL SKReturnsRange(id obj, SEL sel) {
     struct SKRangeCacheEntry { Class cls; SEL sel; BOOL ok; };
     static struct SKRangeCacheEntry cache[48]; static int n;
@@ -46,12 +46,14 @@ static CMTimeRange SKTimeRange(id obj) {
 @interface SKWord : NSObject
 @property (nonatomic) NSRange range;
 @property (nonatomic) double srcStart, srcEnd;
+@property (nonatomic) double origStart, origEnd;   // FCP's own times (keys for corrections and speaker overrides)
 @property (nonatomic) double tlStart, tlEnd;   // NAN when the word has no timeline position (source view)
 @property (nonatomic) BOOL pause;              // a silence item rather than a spoken word
 @property (nonatomic) BOOL filler;             // um / uh and friends
 @property (nonatomic, copy) NSString *speaker;   // display name, nil when unknown
 @property (nonatomic, copy) NSString *mediaPath; // source file the word comes from
-@property (nonatomic, copy) NSString *original;  // FCP's text for the word
+@property (nonatomic, copy) NSString *original;  // the transcript's text for the word (FCP's, or Parakeet's since v82)
+@property (nonatomic, copy) NSString *corrKey;   // correction key when not FCP's start time (words only Parakeet has)
 @property (nonatomic, copy) NSString *text;      // what we show: the original or a correction
 @property (nonatomic) BOOL paragraphStart;       // first word of a phrase paragraph
 @property (nonatomic, strong) id sourceClip;     // browser clip the word belongs to (source view only)
@@ -120,6 +122,8 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic, strong) NSStackView *footerStack;
 @property (nonatomic, strong) NSPopUpButton *timecodePopup;
 @property (nonatomic, strong) NSButton *barsCheckbox;
+@property (nonatomic, strong) NSButton *timingCheckbox;   // View › Word timing (v81)
+@property (nonatomic, strong) NSButton *wordsCheckbox;    // View › Words: Parakeet (v82)
 @property (nonatomic, strong) NSButton *darkCheckbox;   // View › Background: dark instead of the row gray (v74)
 @property (nonatomic, strong) NSArray<NSArray *> *blocks;        // @[NSValue range name…last word, NSColor] per speaker run
 @property (nonatomic, strong) NSArray<NSValue *> *pauseRanges;   // pause items, drawn as capsules
@@ -137,7 +141,7 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic) BOOL built;
 @property (nonatomic) NSUInteger tickCount;
 @property (nonatomic, copy) NSString *renderedSignature, *renderedKey;
-@property (nonatomic) BOOL needsRefresh, refreshQueued;   // coalesced, visible-only redraws
+@property (nonatomic) BOOL needsRefresh, refreshQueued;   // v78: coalesced, visible-only redraws
 - (void)sk_refresh;
 - (void)sk_requestRefresh;
 - (BOOL)sk_deleteAllFillers:(BOOL)fillers;
@@ -421,19 +425,208 @@ static id SKTranscriptForAsset(id asset) {
     return nil;
 }
 
-// A short-lived cache of each asset's words (and media / proxy paths). Fetching FCP's stored
+// v78: a short-lived cache of each asset's words (and media / proxy paths). Fetching FCP's stored
 // transcript and walking it through KVC for every refresh was the bulk of a refresh. Only
 // transcripts WITH words are cached (a missing one is re-checked every time, so the Transcribe flow
 // sees it appear at once); everything expires after 15 min, and a finished transcription clears it.
 @interface SKRawWord : NSObject
 @property (nonatomic, copy) NSString *text;
-@property (nonatomic) double s, e;
+@property (nonatomic) double s, e;     // times in use (Parakeet's when re-timed)
+@property (nonatomic) double os, oe;   // FCP's own times
+@property (nonatomic) NSInteger pk;    // matched Parakeet word (index into the speaker file's words), -1 = none
+@property (nonatomic, copy) NSString *key;   // correction key when not FCP's start time (Parakeet-only words, v82)
 @end
 @implementation SKRawWord
 @end
 static NSMapTable *gPhraseCache;       // asset -> NSArray<NSArray<SKRawWord *> *>
 static CFAbsoluteTime gPhraseCacheBorn;
 static void SKClearAssetCaches(void) { gPhraseCache = nil; }
+// v81: FCP's word times are approximate: inside a phrase they are often 0.1-0.6 s early (measured on
+// an 80-minute interview: 70% of words off by more than 0.15 s against Parakeet), which put cut
+// words inside clips and dropped kept ones. Detect speakers runs SpliceKit's Parakeet, whose word
+// times match the audio, and since v81 stores each word's text too. Each FCP word is matched to the
+// Parakeet word with the same text closest in time (within 1.5 s, in order) and takes its times; an
+// unmatched word is moved by the offset of its matched neighbours. The text stays FCP's.
+static NSDictionary *SKSpeakerEntryForPath(NSString *path);
+static BOOL SKPreciseTiming(void);
+static BOOL SKParakeetText(void);
+static NSString *SKNormWord(NSString *s) {
+    NSMutableString *o = [NSMutableString string];
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c == 0x2019) c = '\'';
+        if ([[NSCharacterSet alphanumericCharacterSet] characterIsMember:c] || c == '\'') [o appendFormat:@"%C", c];
+    }
+    return o.lowercaseString;
+}
+static void SKRetimeWithParakeet(NSArray<NSArray<SKRawWord *> *> *phrases, NSString *path) {
+    NSArray *rows = SKSpeakerEntryForPath(path)[@"words"];
+    if (rows.count == 0 || [rows.firstObject count] < 4) return;   // detected before v81: no text, keep FCP's times
+    NSUInteger n = rows.count;
+    double *ps = malloc(n * sizeof(double)), *pe = malloc(n * sizeof(double));
+    NSMutableArray<NSString *> *pt = [NSMutableArray arrayWithCapacity:n];
+    for (NSUInteger i = 0; i < n; i++) {
+        NSArray *r = rows[i];
+        ps[i] = [r[0] doubleValue]; pe[i] = [r[1] doubleValue];
+        [pt addObject:[r[3] isKindOfClass:[NSString class]] ? SKNormWord(r[3]) : @""];
+    }
+    // 1. Match each FCP word, in order, to the Parakeet word with the same text closest in time.
+    NSMutableArray<SKRawWord *> *all = [NSMutableArray array];
+    for (NSArray<SKRawWord *> *pw in phrases) [all addObjectsFromArray:pw];
+    NSUInteger m = all.count, j0 = 0, matched = 0;
+    NSInteger *pk = malloc(MAX(m, 1) * sizeof(NSInteger));   // matched Parakeet index, or -1
+    for (NSUInteger wi = 0; wi < m; wi++) {
+        SKRawWord *w = all[wi]; pk[wi] = -1;
+        NSString *key = SKNormWord(w.text);
+        NSUInteger j = j0; while (j < n && ps[j] < w.os - 1.5) j++;
+        NSInteger best = -1;
+        for (NSUInteger k = j; k < n && ps[k] <= w.os + 1.5; k++)
+            if ([pt[k] isEqualToString:key] && (best < 0 || fabs(ps[k] - w.os) < fabs(ps[best] - w.os))) best = k;
+        if (best >= 0) { w.s = ps[best]; w.e = pe[best]; pk[wi] = best; w.pk = best; j0 = best + 1; matched++; }
+    }
+    // 2. Runs of unmatched FCP words (often words FCP misheard: "The length of he" for one long word)
+    //    are spread over the Parakeet words between the matched neighbours that overlap the run, keeping
+    //    FCP's relative spacing. With nothing between them, they move by the neighbours' offset.
+    for (NSUInteger a = 0; a < m; ) {
+        if (pk[a] >= 0) { a++; continue; }
+        NSUInteger b = a; while (b < m && pk[b] < 0) b++;          // run = a ..< b
+        NSInteger L = (NSInteger)a - 1, R = b < m ? (NSInteger)b : -1;  // matched neighbours
+        double lo = NAN, hi = NAN;
+        double os0 = all[a].os, oe1 = MAX(all[b - 1].oe, all[b - 1].os);
+        if (L >= 0 && R >= 0 && pk[R] - pk[L] > 1) {
+            // Only the unheard-by-FCP Parakeet words that overlap where FCP put the run (FCP is up
+            // to ~0.6 s early), so an "um, okay" before it isn't pulled in.
+            for (NSInteger k = pk[L] + 1; k < pk[R]; k++) {
+                if (pe[k] <= os0 - 0.15 || ps[k] >= oe1 + 0.6) continue;
+                if (isnan(lo)) lo = ps[k];
+                hi = pe[k];
+            }
+        }
+        if (!isnan(lo) && hi - lo > 0.04 * (b - a)) {
+            double scale = oe1 - os0 > 1e-3 ? (hi - lo) / (oe1 - os0) : 0;
+            for (NSUInteger i = a; i < b; i++) {
+                SKRawWord *w = all[i];
+                w.s = lo + (w.os - os0) * scale; w.e = lo + (MAX(w.oe, w.os) - os0) * scale;
+                if (scale == 0) { w.s = lo + (hi - lo) * (i - a) / (b - a); w.e = lo + (hi - lo) * (i - a + 1) / (b - a); }
+            }
+        } else {
+            double oa = L >= 0 ? all[L].s - all[L].os : NAN, ob = R >= 0 ? all[R].s - all[R].os : NAN;
+            for (NSUInteger i = a; i < b; i++) {
+                double off = 0;
+                if (!isnan(oa) && !isnan(ob)) off = oa + (ob - oa) * (double)(i - L) / (double)(R - L);
+                else if (!isnan(oa)) off = oa; else if (!isnan(ob)) off = ob;
+                SKRawWord *w = all[i]; w.s = w.os + off; w.e = MAX(w.oe, w.os) + off;
+            }
+        }
+        for (NSUInteger i = a; i < b; i++) {   // keep order with the neighbours
+            SKRawWord *w = all[i];
+            if (L >= 0) w.s = MAX(w.s, all[L].e);
+            if (R >= 0) w.e = MIN(w.e, all[R].s);
+            if (w.e < w.s) w.e = w.s;
+        }
+        a = b;
+    }
+    free(pk);
+    NSUInteger total = m;
+    free(ps); free(pe);
+    TLog(@"retimed %@: %lu of %lu words matched to Parakeet", path.lastPathComponent, (unsigned long)matched, (unsigned long)total);
+}
+
+// v82: show Parakeet's words (stored by Detect speakers) instead of FCP's. Apple's transcript drops
+// fillers, repeats and false starts and mishears names and terms; Parakeet keeps what was said.
+// FCP's phrases still set the paragraphs. A Parakeet word matched to an FCP word (same text, see
+// SKRetimeWithParakeet) takes that word's FCP times as its key, so corrections and speaker overrides
+// made before still apply. A run of FCP words with no match is replaced by the Parakeet words there,
+// unless one of them has a correction: then FCP's run, corrected, stays and those Parakeet words are
+// left out. Words only Parakeet has get FCP-equivalent times (their neighbour's offset) and a
+// correction key of their own ("p" + Parakeet start).
+static NSArray<NSArray<SKRawWord *> *> *SKUseParakeetText(NSArray<NSArray<SKRawWord *> *> *phrases, NSString *path) {
+    NSDictionary *entry = SKSpeakerEntryForPath(path);
+    NSArray *rows = entry[@"words"];
+    if (rows.count == 0 || [rows.firstObject count] < 4) return phrases;   // detected before v81: no text
+    NSDictionary *corr = [entry[@"corrections"] isKindOfClass:[NSDictionary class]] ? entry[@"corrections"] : @{};
+    NSUInteger n = rows.count;
+    NSMutableArray<SKRawWord *> *flat = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *phraseOf = [NSMutableArray array];
+    for (NSUInteger p = 0; p < phrases.count; p++) for (SKRawWord *w in phrases[p]) { [flat addObject:w]; [phraseOf addObject:@(p)]; }
+    NSUInteger m = flat.count;
+    // 1. Unmatched FCP runs holding a correction stay; mark the Parakeet words they cover.
+    BOOL *keep = calloc(MAX(m, 1), sizeof(BOOL));
+    NSMutableIndexSet *covered = [NSMutableIndexSet indexSet];
+    for (NSUInteger a = 0; a < m; ) {
+        if (flat[a].pk >= 0) { a++; continue; }
+        NSUInteger b = a; while (b < m && flat[b].pk < 0) b++;
+        BOOL corrected = NO;
+        for (NSUInteger i = a; i < b; i++) if (corr[[NSString stringWithFormat:@"%.3f", flat[i].os]]) corrected = YES;
+        if (corrected) {
+            double lo = flat[a].s, hi = MAX(flat[b - 1].e, flat[b - 1].s);
+            NSInteger from = a > 0 ? flat[a - 1].pk + 1 : 0, to = b < m ? flat[b].pk : (NSInteger)n;
+            for (NSInteger k = from; k < to; k++)
+                if ([rows[k][1] doubleValue] > lo && [rows[k][0] doubleValue] < hi) [covered addIndex:k];
+            for (NSUInteger i = a; i < b; i++) keep[i] = YES;
+        }
+        a = b;
+    }
+    // 2. Walk FCP's words in order, putting Parakeet's words in their place.
+    NSMutableArray<NSMutableArray<SKRawWord *> *> *out = [NSMutableArray array];
+    for (NSUInteger p = 0; p < MAX(phrases.count, 1); p++) [out addObject:[NSMutableArray array]];
+    double off = 0;   // Parakeet time minus FCP time at the last matched word
+    for (SKRawWord *w in flat) if (w.pk >= 0) { off = w.s - w.os; break; }
+    NSUInteger next = 0, matched = 0, added = 0, kept = 0;
+    NSInteger curPhrase = 0; double lastEnd = -INFINITY;
+    SKRawWord *(^pword)(NSUInteger) = ^SKRawWord *(NSUInteger k) {
+        NSArray *r = rows[k]; SKRawWord *x = [SKRawWord new];
+        x.text = [r[3] isKindOfClass:[NSString class]] ? [r[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
+        if ([x.text hasSuffix:@".."] && ![x.text hasSuffix:@"..."]) x.text = [x.text substringToIndex:x.text.length - 1];   // Parakeet's rare "set.."
+        x.s = [r[0] doubleValue]; x.e = MAX([r[1] doubleValue], x.s); x.pk = k;
+        return x;
+    };
+    // A Parakeet-only word goes to the phrase being written if it is nearer that phrase's last word
+    // than the next matched FCP word, else to that word's phrase.
+    for (NSUInteger i = 0; i <= m; i++) {
+        SKRawWord *w = i < m ? flat[i] : nil;
+        NSInteger p = i < m ? phraseOf[i].integerValue : curPhrase;
+        if (w && w.pk < 0) {
+            if (keep[i]) { [out[p] addObject:w]; kept++; curPhrase = p; lastEnd = w.e; }
+            continue;
+        }
+        NSUInteger upTo = w ? (NSUInteger)w.pk : n;
+        for (; next < upTo; next++) {
+            if ([covered containsIndex:next]) continue;
+            SKRawWord *x = pword(next);
+            if (!x.text.length) continue;
+            x.os = x.s - off; x.oe = x.e - off; x.key = [NSString stringWithFormat:@"p%.3f", x.s];
+            NSInteger q = (w && p != curPhrase && x.s - lastEnd >= w.s - x.e) ? p : curPhrase;
+            if (lastEnd == -INFINITY) q = p;
+            [out[q] addObject:x]; added++; curPhrase = q; lastEnd = x.e;
+        }
+        if (!w) break;
+        SKRawWord *x = pword(w.pk);
+        next = w.pk + 1;
+        x.os = w.os; x.oe = w.oe; off = x.s - w.os;
+        [out[p] addObject:x]; matched++; curPhrase = p; lastEnd = x.e;
+    }
+    free(keep);
+    // 3. Paragraphs follow Parakeet's sentences (its punctuation and capitals don't line up with FCP's
+    //    phrase breaks): a new one after a word ending in . ? or !, or before a silence of 1.5 s or more.
+    NSMutableArray<SKRawWord *> *words = [NSMutableArray array];
+    for (NSArray *pw in out) [words addObjectsFromArray:pw];
+    NSMutableArray *result = [NSMutableArray array];
+    NSMutableArray *cur = [NSMutableArray array];
+    NSCharacterSet *closers = [NSCharacterSet characterSetWithCharactersInString:@"\"')]”’"];
+    for (NSUInteger i = 0; i < words.count; i++) {
+        SKRawWord *w = words[i];
+        [cur addObject:w];
+        NSString *t = [w.text stringByTrimmingCharactersInSet:closers];
+        unichar last = t.length ? [t characterAtIndex:t.length - 1] : 0;
+        BOOL end = last == '.' || last == '?' || last == '!' || i + 1 == words.count || words[i + 1].s - w.e >= 1.5;
+        if (end) { [result addObject:cur]; cur = [NSMutableArray array]; }
+    }
+    TLog(@"parakeet text %@: %lu words (%lu matched FCP, %lu only in Parakeet, %lu FCP kept for corrections; FCP had %lu)",
+         path.lastPathComponent, (unsigned long)(matched + added + kept), (unsigned long)matched, (unsigned long)added, (unsigned long)kept, (unsigned long)m);
+    return result;
+}
+
 static NSArray<NSArray<SKRawWord *> *> *SKPhrasesForAsset(id asset) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (!gPhraseCache || now - gPhraseCacheBorn > 900) { gPhraseCache = [NSMapTable strongToStrongObjectsMapTable]; gPhraseCacheBorn = now; }
@@ -451,11 +644,15 @@ static NSArray<NSArray<SKRawWord *> *> *SKPhrasesForAsset(id asset) {
             if (!t.length) continue;
             CMTimeRange tr = SKTimeRange(w);
             SKRawWord *rw = [SKRawWord new];
-            rw.text = t; rw.s = CMTimeGetSeconds(tr.start); rw.e = rw.s + CMTimeGetSeconds(tr.duration);
+            rw.text = t; rw.s = rw.os = CMTimeGetSeconds(tr.start); rw.e = rw.oe = rw.s + CMTimeGetSeconds(tr.duration);
+            rw.pk = -1;
             [list addObject:rw];
         }
         [phrases addObject:list];
     }
+    BOOL parakeetText = SKParakeetText();
+    if (SKPreciseTiming() || parakeetText) SKRetimeWithParakeet(phrases, SKMediaPath(asset));
+    if (parakeetText) phrases = [SKUseParakeetText(phrases, SKMediaPath(asset)) mutableCopy];
     [gPhraseCache setObject:phrases forKey:asset];
     return phrases;
 }
@@ -554,6 +751,8 @@ static void SKSaveSpeakers(void) {
     [data writeToFile:SKSpeakerStorePath() atomically:YES];
 }
 
+static NSMutableDictionary *SKSpeakerEntry(NSString *path, BOOL create);
+static NSDictionary *SKSpeakerEntryForPath(NSString *path) { return SKSpeakerEntry(path, NO); }
 static NSMutableDictionary *SKSpeakerEntry(NSString *path, BOOL create) {
     SKLoadSpeakers();
     if (!path) return nil;
@@ -577,7 +776,7 @@ static NSString *SKMediaPathUncached(id asset) {
     }
     return nil;
 }
-// Cached for 60 s (a failed key path throws, and the symlink resolution hits the disk).
+// v78: cached for 60 s (a failed key path throws, and the symlink resolution hits the disk).
 static NSString *SKMediaPath(id asset) {
     static NSMapTable *cache; static CFAbsoluteTime born;
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
@@ -670,6 +869,7 @@ static NSImage *SKSwatchImage(NSColor *c) {
 // View settings (v63), saved in FCP's defaults.
 static NSString *const kSKTimecodeKey = @"SKTranscriptTabTimecode";             // 0 short, 1 min:sec:frames, 2 project timecode, 3 hidden
 static NSString *const kSKColorBarsKey = @"SKTranscriptTabColorBars";
+static NSString *const kSKPreciseTimingKey = @"SKTranscriptTabPreciseTiming";   // v81: word times from Parakeet (Detect speakers) instead of FCP's
 static NSString *const kSKCollapsedKey = @"SKTranscriptTabCollapsedSections";
 static NSString *const kSKDarkBackgroundKey = @"SKTranscriptTabDarkBackground";   // NO (default): row gray #2D2D2D; YES: inspector dark #1F1F1F
 static NSColor *SKTranscriptBackground(void) {
@@ -678,6 +878,15 @@ static NSColor *SKTranscriptBackground(void) {
 static NSInteger SKTimecodeMode(void) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKTimecodeKey];
     return v ? MAX(0, MIN(3, [v integerValue])) : 1;
+}
+static BOOL SKPreciseTiming(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKPreciseTimingKey];
+    return v ? [v boolValue] : YES;
+}
+static NSString *const kSKParakeetTextKey = @"SKTranscriptTabParakeetText";   // v82: Parakeet's words (Detect speakers) instead of FCP's
+static BOOL SKParakeetText(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKParakeetTextKey];
+    return v ? [v boolValue] : YES;
 }
 static BOOL SKColorBars(void) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKColorBarsKey];
@@ -1005,6 +1214,14 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.darkCheckbox.controlSize = NSControlSizeSmall;
     self.darkCheckbox.state = [[NSUserDefaults standardUserDefaults] boolForKey:kSKDarkBackgroundKey] ? NSControlStateValueOn : NSControlStateValueOff;
     self.darkCheckbox.toolTip = @"Darker transcript background (otherwise the same gray as these rows)";
+    self.timingCheckbox = [NSButton checkboxWithTitle:@"Precise (from Detect)" target:self action:@selector(sk_timingChanged:)];
+    self.timingCheckbox.controlSize = NSControlSizeSmall;
+    self.timingCheckbox.state = SKPreciseTiming() ? NSControlStateValueOn : NSControlStateValueOff;
+    self.timingCheckbox.toolTip = @"Use the word timings from Speakers › Detect (Parakeet) instead of Final Cut Pro's, which are often a few tenths of a second early. Files detected before this option existed need Re-detect once.";
+    self.wordsCheckbox = [NSButton checkboxWithTitle:@"Parakeet (from Detect)" target:self action:@selector(sk_timingChanged:)];
+    self.wordsCheckbox.controlSize = NSControlSizeSmall;
+    self.wordsCheckbox.state = SKParakeetText() ? NSControlStateValueOn : NSControlStateValueOff;
+    self.wordsCheckbox.toolTip = @"Show the words Speakers › Detect (Parakeet) heard instead of Final Cut Pro's transcript: usually more accurate on names and terms, and keeps um/uh and repeats. Your corrections carry over. Files without Detect keep Final Cut Pro's words.";
 
     // FCP inspector layout (v63): sections with a header band, labelled rows on the lighter gray,
     // the transcript below, and Export / Create Captions in a footer bar.
@@ -1039,7 +1256,8 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     addSection(@"cleanup", @"Cleanup", @[makeRow(@"Fillers", @[self.fillerButton]), makeRow(@"Pauses", @[self.pauseButton, threshold])]);
     addSection(@"speakers", @"Speakers", @[makeRow(@"Show", @[self.speakerPopup, self.detectButton])]);
     addSection(@"view", @"View", @[makeRow(@"Timecode", @[self.timecodePopup]), makeRow(@"Text size", @[[self sk_makeSizeControl]]),
-                                   makeRow(@"Color bars", @[self.barsCheckbox]), makeRow(@"Background", @[self.darkCheckbox])]);
+                                   makeRow(@"Color bars", @[self.barsCheckbox]), makeRow(@"Background", @[self.darkCheckbox]),
+                                   makeRow(@"Words", @[self.wordsCheckbox]), makeRow(@"Word timing", @[self.timingCheckbox])]);
     addSection(@"find", @"Find & Replace", @[makeRow(@"Find", @[self.searchField, self.findCount, self.prevButton, self.nextButton]),
                                              makeRow(@"Replace", @[self.replaceField, self.replaceButton, self.replaceAllButton])]);
     addSection(@"transcript", @"Transcript", @[]);
@@ -1270,7 +1488,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
 // Sets the controls' size and fonts, then lays the sections out.
 - (void)sk_applyControlScale {
     // Controls, section headers and the footer stay at FCP's inspector size: Text size only scales
-    // the transcript. Before v71 it scaled the whole panel.
+    // the transcript (v71). Before v71 it scaled the whole panel.
     NSControlSize size = NSControlSizeSmall;
     NSFont *font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]];
     for (NSControl *c in @[self.fillerButton, self.pauseButton, self.thresholdPopup, self.speakerPopup, self.detectButton,
@@ -1283,6 +1501,8 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.timecodePopup.controlSize = size; self.timecodePopup.font = font;
     self.barsCheckbox.controlSize = size; self.barsCheckbox.font = font;
     self.darkCheckbox.controlSize = size; self.darkCheckbox.font = font;
+    self.timingCheckbox.controlSize = size; self.timingCheckbox.font = font;
+    self.wordsCheckbox.controlSize = size; self.wordsCheckbox.font = font;
     NSFont *bold = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold], *plain = [NSFont systemFontOfSize:11];
     for (NSDictionary *sec in self.sections) {
         [(SKSectionHeaderView *)sec[@"header"] setFont:bold plain:plain];
@@ -1345,6 +1565,13 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.scroll.backgroundColor = SKTranscriptBackground();
     TLog(@"transcript background -> %@", sender.state == NSControlStateValueOn ? @"dark" : @"gray");
 }
+- (void)sk_timingChanged:(NSButton *)sender {
+    [[NSUserDefaults standardUserDefaults] setBool:sender.state == NSControlStateValueOn forKey:sender == self.wordsCheckbox ? kSKParakeetTextKey : kSKPreciseTimingKey];
+    TLog(@"%@ -> %d", sender == self.wordsCheckbox ? @"parakeet text" : @"precise timing", sender.state == NSControlStateValueOn);
+    SKClearAssetCaches();
+    [self sk_refresh];
+}
+
 - (void)sk_barsChanged:(NSButton *)sender {
     [[NSUserDefaults standardUserDefaults] setBool:sender.state == NSControlStateValueOn forKey:kSKColorBarsKey];
     [self sk_refresh];
@@ -1420,7 +1647,7 @@ static BOOL SKIsFiller(NSString *text) {
     return [fillers containsObject:[[text lowercaseString] stringByTrimmingCharactersInSet:strip]];
 }
 
-// Redraw requests from FCP events (selection changes, inspector show/hide) are coalesced into
+// v78: redraw requests from FCP events (selection changes, inspector show/hide) are coalesced into
 // one per run-loop turn, and the (expensive) rebuild only happens while the tab is on screen. If it
 // isn't, the request is remembered and sk_tick draws when the tab appears.
 - (BOOL)sk_isShowing {
@@ -1439,7 +1666,7 @@ static BOOL SKIsFiller(NSString *text) {
     for (id it in items) if (![primary containsObject:it]) { seq = NO; break; }
     NSMutableString *k = [NSMutableString string];
     if (seq) [k appendString:@"SEQ"]; else for (id it in items) [k appendFormat:@"%p,", it];
-    [k appendFormat:@"|%@|%@|%.3f|%ld|%d|%g|%.0f", sig, gSpeakerFilter ?: @"", gPauseThreshold, (long)SKTimecodeMode(), SKColorBars(), SKTextScale(), gPhraseCacheBorn];
+    [k appendFormat:@"|%@|%@|%.3f|%ld|%d|%g|%.0f|%d", sig, gSpeakerFilter ?: @"", gPauseThreshold, (long)SKTimecodeMode(), SKColorBars(), SKTextScale(), gPhraseCacheBorn, SKPreciseTiming() + 2 * SKParakeetText()];
     return k;
 }
 - (void)sk_requestRefresh {
@@ -1586,18 +1813,29 @@ static BOOL SKIsFiller(NSString *text) {
                     BOOL opened = NO;
                     for (SKRawWord *rw in pw) {
                         NSString *t = rw.text;
-                        double s = rw.s, e = rw.e;
-                        if (placed && (s < trimStart - 0.001 || s >= trimStart + clipDur - 0.001)) continue;   // trimmed away
+                        double s = rw.s, e = MAX(rw.e, rw.s);
+                        // v81: show a word if at least 2 frames' worth (0.06 s) of it, or half of it, is
+                        // left inside the clip; with accurate times a word you can still partly hear stays.
+                        // v88: when Detect stored the word's main sound (row[4..5]), judge by that: at least
+                        // 0.1 s of it (or 60% of a shorter one) must be in the clip; a faint tail doesn't count.
+                        NSArray *crow = (placed && rw.pk >= 0 && rw.pk < (NSInteger)[entry[@"words"] count]) ? entry[@"words"][rw.pk] : nil;
+                        if (crow.count >= 6 && [crow[5] doubleValue] > [crow[4] doubleValue]) {
+                            double cs = [crow[4] doubleValue], ce = [crow[5] doubleValue];
+                            double ck = MIN(ce, trimStart + clipDur) - MAX(cs, trimStart);
+                            if (ck < MIN(0.10, 0.6 * (ce - cs)) - 1e-4) continue;   // trimmed away
+                        } else if (placed) { double kept = MIN(e, trimStart + clipDur) - MAX(s, trimStart);
+                            if (kept < MIN(0.06, (e - s) / 2) - 1e-4 || (e - s < 1e-4 && (s < trimStart - 0.001 || s >= trimStart + clipDur - 0.001))) continue; }   // trimmed away
                         SKWord *word = [SKWord new];
-                        word.srcStart = s; word.srcEnd = e; word.mediaPath = path;
+                        word.srcStart = s; word.srcEnd = e; word.origStart = rw.os; word.origEnd = rw.oe; word.mediaPath = path;
                         if (!sequenceMode) { word.sourceClip = clip; word.clipOrigin = clipRange.start; word.clipFrame = clipFrame; }
                         word.original = t;
-                        NSString *fixed = corrections[[NSString stringWithFormat:@"%.3f", s]];
+                        word.corrKey = rw.key;
+                        NSString *fixed = corrections[rw.key ?: [NSString stringWithFormat:@"%.3f", rw.os]];
                         word.text = fixed ?: t;
-                        word.tlStart = placed ? tlStart + (s - trimStart) : NAN;
+                        word.tlStart = placed ? tlStart + MAX(s - trimStart, 0) : NAN;
                         word.tlEnd = placed ? MIN(tlStart + (e - trimStart), tlStart + clipDur) : NAN;
                         word.filler = SKIsFiller(word.text);
-                        NSString *sid = entry ? SKSpeakerIDAt(entry, (s + e) / 2) : nil;
+                        NSString *sid = entry ? SKSpeakerIDAt(entry, (rw.os + rw.oe) / 2) : nil;
                         word.speaker = sid ? SKSpeakerName(entry, sid) : nil;
                         if (word.speaker) [speakerNames addObject:word.speaker];
 
@@ -1661,7 +1899,7 @@ static BOOL SKIsFiller(NSString *text) {
         if (missingAssets.count) {
             if (!gTranscribeState) gTranscribeState = [NSMapTable strongToStrongObjectsMapTable];
             // Nothing starts on its own: transcribing writes into the library, so it waits for the
-            // Transcribe button below.
+            // Transcribe link below (2026-10-15).
             NSMutableArray *idleAssets = [NSMutableArray array], *idleClips = [NSMutableArray array];
             for (id a in missingAssets) if (![[gTranscribeState objectForKey:a] isEqualToString:@"running"]) [idleAssets addObject:a];
             for (id c in missingClips) for (id a in SKAssetsForItem(c)) if ([idleAssets containsObject:a]) { [idleClips addObject:c]; break; }
@@ -1719,7 +1957,7 @@ static BOOL SKIsFiller(NSString *text) {
     // polling) keeps the user's selection and any range already marked from it.
     BOOL sameText = [out.string isEqualToString:self.textView.string];
     NSRange keep = self.textView.selectedRange;
-    // When the rebuilt text is identical (inspector toggles, tab switches, re-selecting the same
+    // v78: when the rebuilt text is identical (inspector toggles, tab switches, re-selecting the same
     // clip) keep the existing storage: replacing it throws away the glyphs and layout, which cost
     // more than the rebuild itself. The playhead tint is not part of `out`, so lift it for the
     // comparison; sk_tick puts it back.
@@ -1834,12 +2072,212 @@ static NSData *SKRun(NSString *tool, NSArray *args, int *status, void (^lineHand
     return data;
 }
 
+// v87: Parakeet's word times are only approximate (often 0.2-0.5 s off inside a sentence), so words
+// at a cut were shown or hidden wrongly. `ctcalign` (built from ctcalign/main.swift, installed next
+// to this dylib) places Parakeet's own words on the audio with FluidAudio's small Parakeet CTC model
+// (forced alignment, 80 ms steps) and widens each span for the loudness fit that follows.
+// Rows come back with new start/end; a word it couldn't place keeps Parakeet's times.
+static NSArray *SKAlignWordsWithCTC(NSArray *rows, NSString *wavPath) {
+    Dl_info info;
+    if (!dladdr((const void *)SKAlignWordsWithCTC, &info) || !info.dli_fname) return rows;
+    NSString *tool = [[@(info.dli_fname) stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"ctcalign"];
+    NSString *model = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/FluidAudio/Models/parakeet-ctc-110m-coreml/AudioEncoder.mlmodelc"];
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:tool] || ![[NSFileManager defaultManager] fileExistsAtPath:model]) {
+        TLog(@"detect: no word alignment (tool %d, model %d)", [[NSFileManager defaultManager] isExecutableFileAtPath:tool], [[NSFileManager defaultManager] fileExistsAtPath:model]);
+        return rows;
+    }
+    NSMutableArray *in = [NSMutableArray arrayWithCapacity:rows.count];
+    for (NSArray *r in rows) [in addObject:@[r[0], r[1], r.count > 3 && [r[3] isKindOfClass:[NSString class]] ? r[3] : @""]];
+    NSString *json = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"sk-align-%@.json", [[NSUUID UUID] UUIDString]]];
+    [[NSJSONSerialization dataWithJSONObject:in options:0 error:NULL] writeToFile:json atomically:YES];
+    NSDate *t0 = [NSDate date];
+    int status = 0; __block NSString *summary = nil;
+    NSData *data = SKRun(tool, @[wavPath, json], &status, ^(NSString *line) { summary = line; });
+    [[NSFileManager defaultManager] removeItemAtPath:json error:NULL];
+    NSArray *out = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+    if (status != 0 || ![out isKindOfClass:[NSArray class]] || out.count != rows.count) {
+        TLog(@"detect: word alignment failed (exit %d, %lu rows) %@", status, (unsigned long)[out count], summary ?: @"");
+        return rows;
+    }
+    NSMutableArray *res = [NSMutableArray arrayWithCapacity:rows.count];
+    NSUInteger moved = 0;
+    for (NSUInteger i = 0; i < rows.count; i++) {
+        NSMutableArray *m = [rows[i] mutableCopy];
+        NSArray *a = out[i];
+        if ([a isKindOfClass:[NSArray class]] && a.count >= 3 && [a[2] doubleValue] > -99) {
+            if (fabs([a[0] doubleValue] - [m[0] doubleValue]) > 0.15) moved++;
+            m[0] = a[0]; m[1] = a[1];
+        }
+        [res addObject:m];
+    }
+    TLog(@"detect: aligned words in %.1fs, %lu moved > 0.15 s (%@)", -[t0 timeIntervalSinceNow], (unsigned long)moved, summary ?: @"");
+    return res;
+}
+
 - (void)sk_setDetectStatus:(NSString *)title tip:(NSString *)tip {
     dispatch_async(dispatch_get_main_queue(), ^{
         SKInspectorModuleTranscript *m = gModule;
         m.detectButton.title = title;
         if (tip) m.detectButton.toolTip = tip;
     });
+}
+
+// Parakeet's word starts are accurate, but a word's end usually runs on to the next word's start,
+// through any silence after it, so a word ending before a cut still looked "kept" (v81). Using the
+// same 16 kHz mono WAV, each word's end is pulled back to its last loud 10 ms frame, and its start
+// moved up to its first one (Parakeet also starts a word that follows silence 0.2-0.4 s early). Loud = above the room tone by 20% of the file's speech range.
+static NSArray *SKTightenWordsWithAudio(NSArray *rows, NSString *wavPath) {
+    NSData *d = [NSData dataWithContentsOfFile:wavPath options:NSDataReadingMappedIfSafe error:NULL];
+    if (d.length < 64 || rows.count == 0) return rows;
+    const uint8_t *b = d.bytes; NSUInteger off = 12, dataOff = 0, dataLen = 0;
+    while (off + 8 <= d.length) {   // walk the RIFF chunks to "data"
+        uint32_t len; memcpy(&len, b + off + 4, 4);
+        if (!memcmp(b + off, "data", 4)) { dataOff = off + 8; dataLen = MIN((NSUInteger)len, d.length - dataOff); break; }
+        off += 8 + len + (len & 1);
+    }
+    if (!dataOff) return rows;
+    const int16_t *pcm = (const int16_t *)(b + dataOff);
+    NSUInteger samples = dataLen / 2, hop = 160, frames = samples / hop;   // 10 ms at 16 kHz
+    if (frames < 10) return rows;
+    float *db = malloc(frames * sizeof(float)), *sorted = malloc(frames * sizeof(float));
+    for (NSUInteger f = 0; f < frames; f++) {
+        double s = 0; for (NSUInteger i = 0; i < hop; i++) { double x = pcm[f * hop + i]; s += x * x; }
+        db[f] = sorted[f] = 10 * log10(s / hop + 1e-9);
+    }
+    qsort_b(sorted, frames, sizeof(float), ^int(const void *x, const void *y) { float a = *(const float *)x, c = *(const float *)y; return a < c ? -1 : a > c; });
+    float floorDb = sorted[frames / 10], loud = sorted[frames * 9 / 10], thr = floorDb + 0.2f * (loud - floorDb);
+    free(sorted);
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:rows.count];
+    NSUInteger moved = 0;
+    for (NSArray *r in rows) {
+        double s = [r[0] doubleValue], e = [r[1] doubleValue];
+        NSInteger f0 = (NSInteger)floor(s * 100), f1 = MIN((NSInteger)ceil(e * 100), (NSInteger)frames) - 1, a = -1, z = -1;
+        for (NSInteger f = MAX(f0, 0); f <= f1; f++) if (db[f] > thr) { if (a < 0) a = f; z = f; }
+        NSMutableArray *m = [r mutableCopy];
+        if (z >= 0) {
+            double ns = MAX(s, a / 100.0 - 0.02), ne = MIN(e, (z + 1) / 100.0 + 0.03);   // a word after silence starts ~0.3 s early in Parakeet
+            if (ne - ns >= 0.05) { if (fabs(ns - s) > 0.005 || fabs(ne - e) > 0.005) moved++; m[0] = @(ns); m[1] = @(ne); }
+        }
+        [out addObject:m];
+    }
+    // v85-v86: Parakeet sometimes puts a filler in the silence just before its sound ("work,
+    // uh nature": uh at 605.20-605.28, heard 605.31-605.53; "with uh the": uh at
+    // 1502.08-1502.24, heard 1502.22-1502.41, which Parakeet gave to "the"), so cutting or deleting
+    // the "uh" missed it. A filler whose span is all room tone (nothing above `thr`) moves onto the next
+    // sound starting within 0.4 s (before the next word ends), up to the first dip of 6 dB below that
+    // sound's peak (where the next word starts), at most 0.6 s; the next word then starts after it.
+    // Fillers from the same speaker as the next word only: quiet off-mic questions must not move.
+    NSUInteger shifted = 0;
+    for (NSUInteger i = 0; i + 1 < out.count; i++) {
+        NSMutableArray *w = out[i], *nx = out[i + 1];
+        if (w.count < 4 || ![w[3] isKindOfClass:[NSString class]] || !SKIsFiller(w[3]) || ![w[2] isEqual:nx[2]]) continue;
+        double s = [w[0] doubleValue], e = [w[1] doubleValue], ns = [nx[0] doubleValue], ne = [nx[1] doubleValue];
+        NSInteger f0 = MAX((NSInteger)floor(s * 100), 0), f1 = MIN((NSInteger)ceil(e * 100), (NSInteger)frames) - 1;
+        if (f1 < f0) continue;
+        BOOL heard = NO;
+        for (NSInteger f = f0; f <= f1; f++) if (db[f] > thr) { heard = YES; break; }
+        if (heard) continue;
+        NSInteger a = -1, lim = MIN(MIN(f1 + 40, (NSInteger)ceil(ne * 100) - 5), (NSInteger)frames - 2);
+        for (NSInteger f = f1 + 1; f <= lim; f++) if (db[f] > thr) { a = f; break; }
+        if (a < 0) continue;
+        NSInteger z = -1, stop = MIN(a + 60, (NSInteger)frames - 1);
+        float peak = db[a];
+        for (NSInteger f = a + 1; f < stop; f++) {
+            peak = MAX(peak, db[f]);
+            if (f >= a + 8 && db[f] <= peak - 6 && db[f] <= db[f + 1]) { z = f; break; }
+        }
+        if (z < 0) { z = a; while (z + 1 < stop && db[z + 1] > thr) z++; z++; }
+        double ws = a / 100.0 - 0.02, we = z / 100.0;
+        if (we > ne - 0.05) continue;
+        w[0] = @(ws); w[1] = @(we);
+        if (ns < we) nx[0] = @(we);
+        shifted++;
+        TLog(@"detect: moved '%@' %.2f-%.2f -> %.2f-%.2f (next '%@' from %.2f)", w[3], s, e, ws, we, nx[3], [nx[0] doubleValue]);
+    }
+    // v86: a filler that starts mid-sound usually began a little earlier: Parakeet's filler starts are
+    // ~0.06-0.09 s late in 4 of 10 fillers ("ACME um brought": um at 474.48, sound from
+    // 474.39), and Delete cuts from the word's start, so the onset stayed. Pull the start back to the
+    // first loud frame after the silence within 0.15 s before it (not into the previous word).
+    NSUInteger onsets = 0;
+    for (NSUInteger i = 1; i < out.count; i++) {
+        NSMutableArray *w = out[i], *pv = out[i - 1];
+        if (w.count < 4 || ![w[3] isKindOfClass:[NSString class]] || !SKIsFiller(w[3])) continue;
+        double s = [w[0] doubleValue];
+        NSInteger f = (NSInteger)floor(s * 100);
+        if (f < 0 || f >= (NSInteger)frames || db[f] <= thr) continue;
+        NSInteger g = -1;
+        for (NSInteger k = f - 1; k >= MAX(f - 15, 0); k--) if (db[k] <= thr) { g = k; break; }
+        if (g < 0) continue;
+        double ns = (g + 1) / 100.0 - 0.01;
+        if (ns < [pv[0] doubleValue] + 0.05 || s - ns < 0.015) continue;
+        w[0] = @(ns);
+        if ([pv[1] doubleValue] > ns) pv[1] = @(ns);
+        onsets++;
+    }
+    if (onsets) TLog(@"detect: %lu filler start(s) moved back to their sound's onset", (unsigned long)onsets);
+    // v88: each word's main sound, stored as row[4..5]: the longest stretch of the word's span that is
+    // clearly voiced (above room tone + 40% of the speech range; dips up to 50 ms bridged; falls back to
+    // + 20%). A word's span also holds its fading tail, a breath, or the next word's first frames, so a
+    // cut that left only those still "kept" the word (test markers: um/but/support shown after the
+    // cut with no audio). Longest stretch, not the loudest frame: the next word's onset is often louder.
+    // The tab judges cuts by this. A word with nothing above room + 20% gets -1, -1 (the old rule applies).
+    NSUInteger cores = 0;
+    float mid = floorDb + 0.4f * (loud - floorDb);
+    for (NSMutableArray *w in out) {
+        while (w.count < 4) [w addObject:@""];
+        double s = [w[0] doubleValue], e = [w[1] doubleValue];
+        NSInteger f0 = MAX((NSInteger)floor(s * 100), 0), f1 = MIN((NSInteger)ceil(e * 100), (NSInteger)frames) - 1;
+        double cs = -1, ce = -1;
+        for (int pass = 0; pass < 2 && cs < 0; pass++) {
+            float th = pass == 0 ? mid : thr;
+            NSInteger a = -1, z = -1, ba = -1, bz = -1;
+            for (NSInteger f = f0; f <= f1; f++) {
+                if (db[f] < th) continue;
+                if (a >= 0 && f - z <= 5) z = f;
+                else { if (a >= 0 && (ba < 0 || z - a > bz - ba)) { ba = a; bz = z; } a = z = f; }
+            }
+            if (a >= 0 && (ba < 0 || z - a > bz - ba)) { ba = a; bz = z; }
+            if (ba >= 0) { cs = ba / 100.0; ce = (bz + 1) / 100.0; cores++; }
+        }
+        if (w.count > 4) [w removeObjectsInRange:NSMakeRange(4, w.count - 4)];
+        [w addObject:@(round(cs * 1000) / 1000)]; [w addObject:@(round(ce * 1000) / 1000)];
+    }
+    TLog(@"detect: main sound found for %lu of %lu words", (unsigned long)cores, (unsigned long)out.count);
+    free(db);
+    TLog(@"detect: word edges fitted to the audio for %lu of %lu words, %lu filler(s) moved onto their sound (room tone %.0f dB, speech %.0f dB)",
+         (unsigned long)moved, (unsigned long)rows.count, (unsigned long)shifted, floorDb, loud);
+    return out;
+}
+
+// A new detection run numbers speakers afresh (S1 may become S2). Map each new ID to the earlier ID
+// it overlaps most in time, so names, colors and the filter stay with the right person (v81).
+static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
+    if (old.count == 0 || fresh.count == 0) return fresh;
+    NSDictionary *oldEntry = @{@"words": old};
+    NSMutableDictionary<NSString *, NSCountedSet *> *votes = [NSMutableDictionary dictionary];
+    for (NSArray *r in fresh) {
+        NSString *was = SKSpeakerIDAt(oldEntry, ([r[0] doubleValue] + [r[1] doubleValue]) / 2);
+        if (!was) continue;
+        if (!votes[r[2]]) votes[r[2]] = [NSCountedSet set];
+        [votes[r[2]] addObject:was];
+    }
+    // Greedy: strongest new→old pairs first, each old ID used once.
+    NSMutableArray *pairs = [NSMutableArray array];
+    for (NSString *nid in votes) for (NSString *oid in votes[nid]) [pairs addObject:@[@([votes[nid] countForObject:oid]), nid, oid]];
+    [pairs sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [b[0] compare:a[0]]; }];
+    NSMutableDictionary *map = [NSMutableDictionary dictionary]; NSMutableSet *used = [NSMutableSet set];
+    for (NSArray *p in pairs) if (!map[p[1]] && ![used containsObject:p[2]]) { map[p[1]] = p[2]; [used addObject:p[2]]; }
+    // A speaker the old run didn't have (the new run split someone in two): keep the earlier label
+    // of the words it covers, so a re-detect never turns part of a named speaker into "Speaker N".
+    for (NSString *nid in votes) if (!map[nid]) {
+        NSString *top = nil; NSUInteger best = 0;
+        for (NSString *oid in votes[nid]) if ([votes[nid] countForObject:oid] > best) { best = [votes[nid] countForObject:oid]; top = oid; }
+        if (top) map[nid] = top;
+    }
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:fresh.count];
+    for (NSArray *r in fresh) { NSMutableArray *m = [r mutableCopy]; m[2] = map[r[2]] ?: r[2]; [out addObject:m]; }
+    TLog(@"detect: speaker IDs kept %@", map);
+    return out;
 }
 
 - (void)sk_detectSpeakers:(id)sender {
@@ -1897,12 +2335,17 @@ static NSData *SKRun(NSString *tool, NSArray *args, int *status, void (^lineHand
                     if (![w isKindOfClass:[NSDictionary class]] || !w[@"startTime"]) continue;
                     NSString *sp = w[@"speaker"] ?: last;   // the tool leaves boundary words unlabelled: carry the previous speaker
                     if (sp) last = sp;
-                    [rows addObject:@[w[@"startTime"], w[@"endTime"] ?: w[@"startTime"], sp ?: [NSNull null]]];
+                    [rows addObject:@[w[@"startTime"], w[@"endTime"] ?: w[@"startTime"], sp ?: [NSNull null], [w[@"word"] isKindOfClass:[NSString class]] ? w[@"word"] : @""]];
                 }
                 NSString *firstKnown = nil;
                 for (NSArray *r in rows) if (r[2] != [NSNull null]) { firstKnown = r[2]; break; }
                 NSMutableArray *filled = [NSMutableArray array];
-                if (firstKnown) for (NSArray *r in rows) [filled addObject:@[r[0], r[1], r[2] == [NSNull null] ? firstKnown : r[2]]];
+                if (firstKnown) for (NSArray *r in rows) [filled addObject:@[r[0], r[1], r[2] == [NSNull null] ? firstKnown : r[2], r[3]]];
+                if (filled.count && wav) {
+                    [self sk_setDetectStatus:[@"Aligning words…" stringByAppendingString:label] tip:nil];
+                    filled = [SKAlignWordsWithCTC(filled, wav) mutableCopy];
+                    filled = [SKTightenWordsWithAudio(filled, wav) mutableCopy];
+                }
                 if (filled.count) found[path] = filled;   // a failed run must not wipe earlier labels
                 else failure = toolError ?: [NSString stringWithFormat:@"no speakers found (exit %d)", status];
                 NSMutableSet *ids = [NSMutableSet set];
@@ -1913,8 +2356,9 @@ static NSData *SKRun(NSString *tool, NSArray *args, int *status, void (^lineHand
             if (wav) [[NSFileManager defaultManager] removeItemAtPath:wav error:NULL];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
-            for (NSString *path in found) SKSpeakerEntry(path, YES)[@"words"] = found[path];
+            for (NSString *path in found) { NSMutableDictionary *entry = SKSpeakerEntry(path, YES); entry[@"words"] = SKKeepSpeakerIDs(entry[@"words"], found[path]); }
             SKSaveSpeakers();
+            SKClearAssetCaches();   // re-time with the new words
             gDetecting = NO;
             [gModule sk_refresh];
             if (failure) {
@@ -1948,9 +2392,9 @@ static NSData *SKRun(NSString *tool, NSArray *args, int *status, void (^lineHand
         NSMutableArray *overrides = entry[@"overrides"];
         NSArray *prev = overrides.lastObject;
         // Extend the previous override when this word follows straight on from it.
-        if (prev && [prev[2] isEqualToString:sid] && w.srcStart >= [prev[0] doubleValue] && w.srcStart - [prev[1] doubleValue] < 0.5)
+        if (prev && [prev[2] isEqualToString:sid] && w.origStart >= [prev[0] doubleValue] && w.origStart - [prev[1] doubleValue] < 0.5)
             overrides[overrides.count - 1] = @[prev[0], @(MAX(w.srcEnd, [prev[1] doubleValue])), sid];
-        else [overrides addObject:@[@(w.srcStart), @(w.srcEnd), sid]];
+        else [overrides addObject:@[@(w.origStart), @(w.origEnd), sid]];
         n++;
     }
     TLog(@"assign '%@' to %lu word(s)", name, (unsigned long)n);
@@ -2626,6 +3070,7 @@ static NSString *SKTimecodeDF(double t) {
     for (SKWord *w in self.allItems) {
         if (w.pause) { flush(); continue; }
         if (isnan(w.tlStart) || w.text.length == 0) continue;
+        if (w.filler) continue;   // v82: Parakeet's um/uh stay out of captions (FCP's text never had them)
         if (w.speaker && lastSpeaker && ![w.speaker isEqualToString:lastSpeaker]) flush();
         lastSpeaker = w.speaker ?: lastSpeaker;
         NSUInteger len = 0; for (SKWord *c in cur) len += c.text.length + 1;
@@ -2704,7 +3149,7 @@ static NSURL *gPendingCaptionURL;
 // survive re-renders and restarts. An empty correction hides a word (used when a replacement
 // merges several words into one, e.g. "sound bite" -> "soundbite").
 
-static NSString *SKCorrectionKey(SKWord *w) { return [NSString stringWithFormat:@"%.3f", w.srcStart]; }
+static NSString *SKCorrectionKey(SKWord *w) { return w.corrKey ?: [NSString stringWithFormat:@"%.3f", w.origStart]; }
 
 static NSMutableDictionary *SKCorrections(NSString *path, BOOL create) {
     NSMutableDictionary *entry = SKSpeakerEntry(path, create);
@@ -3133,7 +3578,7 @@ static BOOL h_ids(id self, SEL _cmd, id items, __autoreleasing id *outIds, __aut
         NSArray *ids = [*outIds isKindOfClass:[NSOrderedSet class]] ? [(NSOrderedSet *)*outIds array] : (NSArray *)*outIds;
         if ([ids containsObject:kTabIdent]) return r;
         if ([ids containsObject:@"FFInspectorTabLibraryPropertiesIdentifier"]) return r;
-        // Titles and other effects with their own inspector tab (Title/Text, identifier = the
+        // v79: titles and other effects with their own inspector tab (Title/Text, identifier = the
         // effect class, e.g. FFMotionEffect) lose those tabs, and Color, if a tab is added here, so
         // leave the list alone for them. A title has no transcript anyway.
         for (id k in ids) if ([k isKindOfClass:[NSString class]] && ![k hasPrefix:@"FFInspectorTab"]) {
@@ -3405,5 +3850,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.1.1 loaded");
+    TLog(@"Transcript Tab 1.2.0 loaded");
 }

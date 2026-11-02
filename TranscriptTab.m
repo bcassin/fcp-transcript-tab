@@ -101,6 +101,7 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic, strong) NSArray<SKWord *> *words;      // items drawn in the text view
 @property (nonatomic, strong) NSArray<SKWord *> *allItems;   // every timeline item in order, including filtered-out ones
 @property (nonatomic, strong) NSArray<NSString *> *mediaPaths;
+@property (nonatomic, copy) NSString *timelineName;   // project name in timeline view, else nil (export file name)
 @property (nonatomic, strong) NSDictionary<NSString *, NSString *> *proxyPaths;   // media path -> FCP proxy file, when one exists
 @property (nonatomic, strong) NSPopUpButton *speakerPopup, *assignPopup;
 @property (nonatomic, strong) NSButton *detectButton;
@@ -1753,6 +1754,7 @@ static BOOL SKIsFiller(NSString *text) {
     NSUInteger fillerCount = 0, pauseCount = 0;
 
     gRetryRange = NSMakeRange(NSNotFound, 0);
+    NSString *timelineName = nil;
     @try {
         NSArray *primary = SKPrimaryItems();
         // Connected clips over primary gaps join the timeline view (v76; always on since v77).
@@ -1762,6 +1764,12 @@ static BOOL SKIsFiller(NSString *text) {
         BOOL sequenceMode = items.count > 0 && primary.count > 0;
         for (id item in items) if (![primary containsObject:item] && ![connectedClips containsObject:item]) sequenceMode = NO;
         NSArray *clips = sequenceMode ? primary : items;
+        if (sequenceMode) {
+            id seq = ((id(*)(id,SEL))objc_msgSend)(SKTimelineModule(), @selector(sequence));
+            for (NSString *key in @[@"displayName", @"name"]) {
+                @try { id n = [seq valueForKey:key]; if ([n isKindOfClass:[NSString class]] && [n length]) { timelineName = n; break; } } @catch (id e) {}
+            }
+        }
         // What to walk, in timeline order: primary items, then each connected clip at its start.
         NSMutableArray<NSDictionary *> *entries = [NSMutableArray array];
         for (id c in clips) {
@@ -1948,6 +1956,7 @@ static BOOL SKIsFiller(NSString *text) {
     self.allItems = all;
     self.labelRanges = labels;
     self.mediaPaths = mediaPaths.array;
+    self.timelineName = timelineName;
     self.proxyPaths = proxies;
     self.renderedSignature = SKTimelineSignature();
     self.renderedKey = [self sk_renderKeyWithSignature:self.renderedSignature];
@@ -3114,7 +3123,9 @@ static NSString *SKTimecodeDF(double t) {
     }
     if (!path) {
         NSSavePanel *panel = [NSSavePanel savePanel];
-        NSString *base = [[[self.mediaPaths.firstObject lastPathComponent] stringByDeletingPathExtension] ?: @"Transcript" stringByAppendingString:@" transcript"];
+        NSString *base = self.timelineName.length ? [self.timelineName stringByAppendingString:@"_transcript"]
+            : [[[self.mediaPaths.firstObject lastPathComponent] stringByDeletingPathExtension] ?: @"Transcript" stringByAppendingString:@" transcript"];
+        base = [base stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
         panel.nameFieldStringValue = [base stringByAppendingPathExtension:kind == 2 ? @"srt" : @"txt"];
         if ([panel runModal] != NSModalResponseOK) return NO;
         path = panel.URL.path;
@@ -3850,5 +3861,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.2.0 loaded");
+    TLog(@"Transcript Tab 1.2.1 loaded");
 }

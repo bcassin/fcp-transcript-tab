@@ -332,6 +332,28 @@ static BOOL SKCallBool(id obj, NSString *sel) {
 }
 // Connected clips (and clips inside connected storylines) with media that overlap a primary gap,
 // each as @{clip, tl, trim, dur} in timeline seconds (trim = where the visible part starts in the media).
+// Is this item anywhere in the open timeline — primary, connected to a primary item, or
+// inside a connected storyline? Inspector items that are (a camera angle connected on top, a
+// title…) keep the timeline view; before, only connected clips over gaps did, so a connected
+// angle under the playhead flipped the tab to that clip's own transcript, and a text selection
+// there sent the timeline clip to the browser, which crashed FCP (-sequenceRecord).
+static BOOL SKIsTimelineItem(id item, NSArray *primary) {
+    if (!item) return NO;
+    if ([primary containsObject:item]) return YES;
+    @try {
+        for (id p in primary) {
+            id anchored = [p respondsToSelector:NSSelectorFromString(@"anchoredItems")] ? [p valueForKey:@"anchoredItems"] : nil;
+            NSArray *list = [anchored isKindOfClass:[NSSet class]] ? [(NSSet *)anchored allObjects] : [anchored isKindOfClass:[NSArray class]] ? anchored : @[];
+            for (id a in list) {
+                if (a == item) return YES;
+                if (SKCallBool(a, @"isConnectedStoryline"))
+                    for (id inner in [a valueForKey:@"containedItems"]) if (inner == item) return YES;
+            }
+        }
+    } @catch (id e) {}
+    return NO;
+}
+
 static NSArray<NSDictionary *> *SKConnectedOverGaps(NSArray *primary, NSArray<NSValue *> *gaps) {
     NSMutableArray *out = [NSMutableArray array];
     if (!gaps.count) return out;
@@ -1762,7 +1784,7 @@ static BOOL SKIsFiller(NSString *text) {
         NSArray<NSDictionary *> *connected = gaps.count ? SKConnectedOverGaps(primary, gaps) : @[];
         NSArray *connectedClips = [connected valueForKey:@"clip"];
         BOOL sequenceMode = items.count > 0 && primary.count > 0;
-        for (id item in items) if (![primary containsObject:item] && ![connectedClips containsObject:item]) sequenceMode = NO;
+        for (id item in items) if (![connectedClips containsObject:item] && !SKIsTimelineItem(item, primary)) sequenceMode = NO;
         NSArray *clips = sequenceMode ? primary : items;
         if (sequenceMode) {
             id seq = ((id(*)(id,SEL))objc_msgSend)(SKTimelineModule(), @selector(sequence));
@@ -2881,14 +2903,27 @@ static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead, CMTim
     if (ranged && list && [list respondsToSelector:inSel] && [list respondsToSelector:outSel]) {
         // Clear the clip's existing marks first (Option-X); list view keeps several ranges per clip.
         // Then the playhead: In/Out act on the clip under the strip's playhead.
-        SEL clear = NSSelectorFromString(@"clearSelection:");
-        if ([fs respondsToSelector:clear]) ((void(*)(id,SEL,id))objc_msgSend)(fs, clear, nil);
-        if ([fs respondsToSelector:move]) ((void(*)(id,SEL,id,CMTime))objc_msgSend)(fs, move, ranged, playhead);
-        CMTime fd = CMTIME_IS_NUMERIC(frame) && frame.value > 0 ? frame : SKFrameDuration();
-        CMTime lastFrame = CMTimeSubtract(CMTimeRangeGetEnd(range), fd);
-        if (CMTimeCompare(lastFrame, range.start) < 0) lastFrame = range.start;
-        ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, inSel, range.start, YES);
-        ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, outSel, lastFrame, NO);
+        // FCP can throw inside these calls (e.g. an unrecognized selector in
+        // -[FFOrganizerFilmstripView _conformArray:toBaseRangesMapTable:] under
+        // setSelectionStartTime:), and an exception that reaches FCP's run loop aborts the app.
+        // Catch it here: the marks may be left unset, but FCP keeps running.
+        NSString *before = [SKBrowserSelection(fs) description];
+        @try {
+            SEL clear = NSSelectorFromString(@"clearSelection:");
+            if ([fs respondsToSelector:clear]) ((void(*)(id,SEL,id))objc_msgSend)(fs, clear, nil);
+            if ([fs respondsToSelector:move]) ((void(*)(id,SEL,id,CMTime))objc_msgSend)(fs, move, ranged, playhead);
+            CMTime fd = CMTIME_IS_NUMERIC(frame) && frame.value > 0 ? frame : SKFrameDuration();
+            CMTime lastFrame = CMTimeSubtract(CMTimeRangeGetEnd(range), fd);
+            if (CMTimeCompare(lastFrame, range.start) < 0) lastFrame = range.start;
+            ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, inSel, range.start, YES);
+            ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, outSel, lastFrame, NO);
+        } @catch (NSException *e) {
+            NSString *name = nil; @try { name = [clip valueForKey:@"displayName"]; } @catch (id x) {}
+            TLog(@"browser (list view) In/Out threw %@: %@ — clip '%@' (%@ %p), selection before: %@; stack: %@",
+                 e.name, e.reason, name, [clip class], clip, before,
+                 [[e.callStackSymbols subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)12, e.callStackSymbols.count))] componentsJoinedByString:@" | "]);
+            return NO;   // don't try the other paths on a selection FCP just choked on
+        }
         ok = SKBrowserSelectionIs(fs, browserObject, range);
         TLog(@"browser (list view) In/Out -> %@ (match=%d)", [SKBrowserSelection(fs) description], ok);
         TLog(@"browser mark %.3f–%.3f on %@ (%p, list view) -> %d", CMTimeGetSeconds(range.start), CMTimeGetSeconds(CMTimeRangeGetEnd(range)), [clip class], clip, ok);
@@ -2972,8 +3007,14 @@ static id SKClipAtTime(double t);
     for (SKWord *w in hit) if (w.sourceClip != hit.firstObject.sourceClip) { TLog(@"selection spans clips; not marking"); NSBeep(); return NO; }
     SKWord *a = hit.firstObject, *b = hit.lastObject;
     CMTime s = SKClipTime(a, a.srcStart, -1), e = SKClipTime(b, b.srcEnd, 1);
-    TLog(@"mark source '%@'…'%@' media %.3f–%.3f", a.text, b.text, a.srcStart, b.srcEnd);
-    self.sourceMarked = SKRevealInBrowser(a.sourceClip, CMTimeRangeFromTimeToTime(s, e), s, a.clipFrame);
+    NSString *clipName = nil; @try { clipName = [a.sourceClip valueForKey:@"displayName"]; } @catch (id x) {}
+    TLog(@"mark source '%@'…'%@' media %.3f–%.3f in '%@' (%@ %p)", a.text, b.text, a.srcStart, b.srcEnd, clipName, [a.sourceClip class], a.sourceClip);
+    @try {   // Never let an FCP exception from the browser calls reach its run loop (it aborts)
+        self.sourceMarked = SKRevealInBrowser(a.sourceClip, CMTimeRangeFromTimeToTime(s, e), s, a.clipFrame);
+    } @catch (NSException *ex) {
+        TLog(@"mark source threw %@: %@", ex.name, ex.reason);
+        self.sourceMarked = NO;
+    }
     [self sk_updateSourceButtons];
     return self.sourceMarked;
 }
@@ -3973,5 +4014,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.3.0 loaded");
+    TLog(@"Transcript Tab 1.3.1 loaded");
 }

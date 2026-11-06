@@ -1191,7 +1191,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.exportPopup = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:YES];
     self.exportPopup.controlSize = NSControlSizeSmall; self.exportPopup.font = self.fillerButton.font;
     [self.exportPopup addItemWithTitle:@"Export"];
-    NSArray *exportItems = @[@[@"Transcript with timecodes…", @3], @[@"Plain text (no timecodes)…", @0], @[@"Subtitles (SRT)…", @2]];
+    NSArray *exportItems = @[@[@"Transcript with timecodes…", @3], @[@"Transcript by speaker…", @4], @[@"Plain text (no timecodes)…", @0], @[@"Subtitles (SRT)…", @2]];
     for (NSArray *e in exportItems) {
         NSMenuItem *it = [self.exportPopup.menu addItemWithTitle:e[0] action:@selector(sk_exportMenu:) keyEquivalent:@""];
         it.target = self; it.tag = [e[1] integerValue];
@@ -1427,7 +1427,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
         if ([cmd isEqualToString:@"captions"]) { TLog(@"test captions ok=%d", [m sk_createCaptions:nil]); return; }
         NSRange colon = [cmd rangeOfString:@":"];
         if (colon.location == NSNotFound) return;
-        NSInteger kind = [@[@"txt", @"tc", @"srt", @"premiere"] indexOfObject:[cmd substringToIndex:colon.location]];
+        NSInteger kind = [@[@"txt", @"tc", @"srt", @"premiere", @"speakers"] indexOfObject:[cmd substringToIndex:colon.location]];
         if (kind != NSNotFound) [m sk_export:kind toPath:[cmd substringFromIndex:colon.location + 1]];
     }];
     // Find a browser clip by name in any open library, report it, and select it whole in the browser.
@@ -3066,6 +3066,75 @@ static NSString *SKTimecodeDF(double t) {
     return out;
 }
 
+// One block per speaker turn —
+//   Title
+//   (blank line)
+//   00:00:05.880 — 00:00:20.760 · Speaker Name
+//   Everything that speaker says until the next speaker (or a long silence).
+//   (blank line) next paragraph of the same turn, after a cut or a pause
+//   (two blank lines)
+// A new block starts at a speaker change or a silence of 4 s or more; inside a block a new
+// paragraph starts at a cut (the source jumps or the media file changes) or a 1.5 s silence,
+// when the previous word ends a sentence.
+static NSString *SKClockMS(double t) {
+    int64_t ms = (int64_t)llround(MAX(0, t) * 1000);
+    return [NSString stringWithFormat:@"%02lld:%02lld:%02lld.%03lld", ms / 3600000, ms / 60000 % 60, ms / 1000 % 60, ms % 1000];
+}
+- (NSString *)sk_exportSpeakerBlocks {
+    NSMutableString *out = [NSMutableString string];
+    NSString *title = self.timelineName.length ? self.timelineName
+        : [[self.mediaPaths.firstObject lastPathComponent] stringByDeletingPathExtension];
+    if (title.length) [out appendFormat:@"%@\n\n", title];
+    // Source view with several clips: each file's times start at 0, so each file gets its own
+    // name line and blocks never run across files.
+    BOOL multiFile = !self.timelineName.length && self.mediaPaths.count > 1;
+    if (multiFile) [out setString:@""];
+    if (multiFile) { SKWord *f = nil; for (SKWord *w in self.words) if (!w.pause && w.text.length) { f = w; break; }
+        if (f.mediaPath) [out appendFormat:@"%@\n\n", [[f.mediaPath lastPathComponent] stringByDeletingPathExtension]]; }
+    NSMutableArray<NSString *> *paras = [NSMutableArray array];
+    NSMutableArray<NSString *> *para = [NSMutableArray array];
+    __block double bStart = NAN, bEnd = NAN;
+    __block NSString *bSpeaker = nil;
+    __block NSUInteger blocks = 0;
+    void (^endPara)(void) = ^{ if (para.count) [paras addObject:[para componentsJoinedByString:@" "]]; [para removeAllObjects]; };
+    void (^endBlock)(void) = ^{
+        endPara();
+        if (paras.count) {
+            [out appendFormat:@"%@ — %@ · %@\n%@\n\n\n", SKClockMS(bStart), SKClockMS(bEnd), bSpeaker ?: @"Unknown",
+                [paras componentsJoinedByString:@"\n\n"]];
+            blocks++;
+        }
+        [paras removeAllObjects];
+    };
+    SKWord *prev = nil;
+    for (SKWord *w in self.words) {
+        if (w.pause || w.text.length == 0) continue;
+        BOOL tl = !isnan(w.tlStart);
+        double s = tl ? w.tlStart : w.srcStart, e = tl ? w.tlEnd : w.srcEnd;
+        if (prev) {
+            double ps = tl && !isnan(prev.tlStart) ? prev.tlStart : prev.srcStart, pe = tl && !isnan(prev.tlEnd) ? prev.tlEnd : prev.srcEnd;
+            double gap = s - pe;
+            BOOL cut = ![w.mediaPath ?: @"" isEqualToString:prev.mediaPath ?: @""]
+                || (tl && fabs((w.srcStart - prev.srcStart) - (s - ps)) > 0.5);
+            // (Not on a file change in timeline view: a synchronized clip holds several mics of one person.)
+            BOOL newFile = !tl && ![w.mediaPath ?: @"" isEqualToString:prev.mediaPath ?: @""];
+            if (newFile || ![w.speaker ?: @"" isEqualToString:bSpeaker ?: @""] || gap >= 4.0) endBlock();
+            if (newFile) [out appendFormat:@"%@\n\n", [[w.mediaPath lastPathComponent] stringByDeletingPathExtension] ?: @""];
+            else if (cut || gap >= 1.5) {   // only between sentences: cuts that drop an um mid-sentence don't split it
+                unichar last = prev.text.length ? [prev.text characterAtIndex:prev.text.length - 1] : 0;
+                if (last == '.' || last == '?' || last == '!' || last == '"' || last == 0x201D) endPara();
+            }
+        }
+        if (para.count == 0 && paras.count == 0) { bStart = s; bSpeaker = w.speaker; }
+        bEnd = e;
+        [para addObject:w.text];
+        prev = w;
+    }
+    endBlock();
+    TLog(@"export speaker blocks: %lu blocks", (unsigned long)blocks);
+    return blocks ? out : @"";
+}
+
 // The transcript as plain text, one paragraph per phrase, with "Name:" when speakers are
 // known and "[timecode]" when asked. Follows what the tab shows: corrections, and the speaker
 // filter if one is on. Pause markers are left out.
@@ -3147,11 +3216,11 @@ static NSString *SKTimecodeDF(double t) {
     return srt;
 }
 
-// kind: 0 text, 1 text with timecodes, 2 SRT, 3 Premiere-style transcript. Writes to `path`,
+// kind: 0 text, 1 text with timecodes, 2 SRT, 3 Premiere-style transcript, 4 speaker blocks. Writes to `path`,
 // or asks with a save panel.
 - (BOOL)sk_export:(NSInteger)kind toPath:(NSString *)path {
     if (kind == 1) kind = 3;   // "with timecodes" is the Premiere-style layout
-    NSString *body = kind == 3 ? [self sk_exportPremiere] : kind == 2 ? [self sk_srt] : [self sk_exportTextWithTimecodes:NO];
+    NSString *body = kind == 4 ? [self sk_exportSpeakerBlocks] : kind == 3 ? [self sk_exportPremiere] : kind == 2 ? [self sk_srt] : [self sk_exportTextWithTimecodes:NO];
     if (body.length == 0) {   // e.g. FCP is still transcribing: don't write an empty file
         TLog(@"export kind=%ld skipped: no transcript yet", (long)kind);
         NSBeep();
@@ -3639,7 +3708,14 @@ static BOOL h_ids(id self, SEL _cmd, id items, __autoreleasing id *outIds, __aut
         else if ([sample isKindOfClass:[NSString class]]) value = @"SKInspectorModuleTranscript";
         else value = [SKInspectorModuleTranscript class];
             [map setObject:value forKey:kTabIdent];
-        NSArray *newIds = [ids arrayByAddingObject:kTabIdent];
+        // Right after Info (before FCP's Share tab on browser clips), else at the end.
+        NSMutableArray *newIds = [ids mutableCopy];
+        NSUInteger infoIdx = NSNotFound;
+        for (NSUInteger i = 0; i < ids.count; i++)
+            if ([ids[i] isKindOfClass:[NSString class]] && [ids[i] rangeOfString:@"Info"].location != NSNotFound) infoIdx = i;
+        if (infoIdx == NSNotFound) [newIds addObject:kTabIdent]; else [newIds insertObject:kTabIdent atIndex:infoIdx + 1];
+        static NSString *lastOrder; NSString *order = [newIds componentsJoinedByString:@","];
+        if (![order isEqual:lastOrder]) { lastOrder = order; TLog(@"tabs: %@", order); }
         *outIds = [*outIds isKindOfClass:[NSOrderedSet class]] ? (id)[NSOrderedSet orderedSetWithArray:newIds] : (id)newIds;
     } @catch (id e) { TLog(@"h_ids threw %@", e); }
     return r;
@@ -3897,5 +3973,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.2.2 loaded");
+    TLog(@"Transcript Tab 1.3.0 loaded");
 }

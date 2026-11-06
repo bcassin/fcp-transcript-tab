@@ -48,7 +48,7 @@ SpliceKit-patched copy of Final Cut Pro.
 
 **Find, fix and export**
 - Find & Replace (⌘F), and double-click a word to correct a transcription mistake.
-- Export a timecoded transcript (Premiere Pro's layout), plain text, or SRT subtitles.
+- Export a timecoded transcript (Premiere Pro's layout), a transcript grouped by speaker (one timecode per speaker turn), plain text, or SRT subtitles.
 - Create Captions puts the transcript on the timeline as Final Cut Pro captions, in one undo step.
 
 **View options**
@@ -67,7 +67,7 @@ SpliceKit-patched copy of Final Cut Pro.
 
 ## Install
 
-1. Download `TranscriptTab-1.2.2.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `TranscriptTab-1.3.0.zip` from the [Releases](../../releases) page and unzip it.
    You get a folder called `com.innerparakeet.transcript-tab`.
 2. Move that folder into SpliceKit's plugins folder:
    `~/Library/Application Support/SpliceKit/plugins/`

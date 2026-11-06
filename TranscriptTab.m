@@ -2822,9 +2822,22 @@ static id SKFilmstripModule(void) {
     } @catch (id e) { return nil; }
 }
 
+// The browser's list-view controller when the browser is in list view, else nil.
+static id SKBrowserListController(id fs) {
+    SEL cur = NSSelectorFromString(@"currentFilmViewController");
+    id c = [fs respondsToSelector:cur] ? ((id(*)(id,SEL))objc_msgSend)(fs, cur) : nil;
+    return [NSStringFromClass([c class]) containsString:@"FilmList"] ? c : nil;
+}
+
+// In list view `selectedRangesOfMedia` is nil; the selection lives in `activeSelection`.
 static NSArray *SKBrowserSelection(id fs) {
     SEL sel = NSSelectorFromString(@"selectedRangesOfMedia");
-    return [fs respondsToSelector:sel] ? ((id(*)(id,SEL))objc_msgSend)(fs, sel) : nil;
+    NSArray *r = [fs respondsToSelector:sel] ? ((id(*)(id,SEL))objc_msgSend)(fs, sel) : nil;
+    if (!r.count && SKBrowserListController(fs)) {
+        SEL act = NSSelectorFromString(@"activeSelection");
+        if ([fs respondsToSelector:act]) r = ((id(*)(id,SEL))objc_msgSend)(fs, act);
+    }
+    return r;
 }
 
 // Does the browser selection hold `range` on `clip` (to within a frame)?
@@ -2842,7 +2855,7 @@ static BOOL SKBrowserSelectionIs(id fs, id clip, CMTimeRange range) {
 
 // Select `range` (clip time) on a browser clip and put the browser playhead at `playhead`.
 // Tries FCP's own range-selection call first, then reveal-and-select; logs what worked.
-static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead) {
+static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead, CMTime frame) {
     id fs = SKFilmstripModule();
     if (!fs) { TLog(@"browser module unavailable"); return NO; }
     Class rao = objc_getClass("FigTimeRangeAndObject");
@@ -2857,8 +2870,32 @@ static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead) {
     }
     id ranged = ((id(*)(id,SEL,CMTimeRange,id))objc_msgSend)(rao, NSSelectorFromString(@"rangeAndObjectWithRange:andObject:"), range, browserObject);
     BOOL ok = NO;
+    // List view: _selectMediaRanges: and the list's selectArbitraryRange: match the range to
+    // rows in the list (whole clips, keyword/favorite sub-rows), so a range inside a clip selects the
+    // wrong rows or nothing. Set In and Out instead, the way the I and O keys do (clip time; O marks
+    // through the end of the frame it is given, so give it the last frame).
+    id list = SKBrowserListController(fs);
+    SEL inSel = NSSelectorFromString(@"setSelectionStartTime:clearExistingSelection:");
+    SEL outSel = NSSelectorFromString(@"setSelectionEndTime:clearExistingSelection:");
+    SEL move = NSSelectorFromString(@"moveToRangeOfMedia:andTime:");
+    if (ranged && list && [list respondsToSelector:inSel] && [list respondsToSelector:outSel]) {
+        // Clear the clip's existing marks first (Option-X); list view keeps several ranges per clip.
+        // Then the playhead: In/Out act on the clip under the strip's playhead.
+        SEL clear = NSSelectorFromString(@"clearSelection:");
+        if ([fs respondsToSelector:clear]) ((void(*)(id,SEL,id))objc_msgSend)(fs, clear, nil);
+        if ([fs respondsToSelector:move]) ((void(*)(id,SEL,id,CMTime))objc_msgSend)(fs, move, ranged, playhead);
+        CMTime fd = CMTIME_IS_NUMERIC(frame) && frame.value > 0 ? frame : SKFrameDuration();
+        CMTime lastFrame = CMTimeSubtract(CMTimeRangeGetEnd(range), fd);
+        if (CMTimeCompare(lastFrame, range.start) < 0) lastFrame = range.start;
+        ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, inSel, range.start, YES);
+        ((void(*)(id,SEL,CMTime,BOOL))objc_msgSend)(list, outSel, lastFrame, NO);
+        ok = SKBrowserSelectionIs(fs, browserObject, range);
+        TLog(@"browser (list view) In/Out -> %@ (match=%d)", [SKBrowserSelection(fs) description], ok);
+        TLog(@"browser mark %.3f–%.3f on %@ (%p, list view) -> %d", CMTimeGetSeconds(range.start), CMTimeGetSeconds(CMTimeRangeGetEnd(range)), [clip class], clip, ok);
+        if (ok) return YES;
+    }
     SEL selectSel = NSSelectorFromString(@"_selectMediaRanges:");
-    if (ranged && [fs respondsToSelector:selectSel]) {
+    if (!ok && ranged && [fs respondsToSelector:selectSel]) {
         ((void(*)(id,SEL,id))objc_msgSend)(fs, selectSel, @[ranged]);
         ok = SKBrowserSelectionIs(fs, browserObject, range);
         TLog(@"browser _selectMediaRanges: -> %@ (match=%d)", [SKBrowserSelection(fs) description], ok);
@@ -2872,7 +2909,6 @@ static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead) {
         }
     }
     // Browser playhead to the start of the range.
-    SEL move = NSSelectorFromString(@"moveToRangeOfMedia:andTime:");
     if (ranged && [fs respondsToSelector:move]) ((void(*)(id,SEL,id,CMTime))objc_msgSend)(fs, move, ranged, playhead);
     TLog(@"browser mark %.3f–%.3f on %@ (%p, browser object %p) -> %d", CMTimeGetSeconds(range.start), CMTimeGetSeconds(CMTimeRangeGetEnd(range)),
          [clip class], clip, browserObject, ok);
@@ -2937,7 +2973,7 @@ static id SKClipAtTime(double t);
     SKWord *a = hit.firstObject, *b = hit.lastObject;
     CMTime s = SKClipTime(a, a.srcStart, -1), e = SKClipTime(b, b.srcEnd, 1);
     TLog(@"mark source '%@'…'%@' media %.3f–%.3f", a.text, b.text, a.srcStart, b.srcEnd);
-    self.sourceMarked = SKRevealInBrowser(a.sourceClip, CMTimeRangeFromTimeToTime(s, e), s);
+    self.sourceMarked = SKRevealInBrowser(a.sourceClip, CMTimeRangeFromTimeToTime(s, e), s, a.clipFrame);
     [self sk_updateSourceButtons];
     return self.sourceMarked;
 }
@@ -3861,5 +3897,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.2.1 loaded");
+    TLog(@"Transcript Tab 1.2.2 loaded");
 }

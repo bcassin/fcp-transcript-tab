@@ -290,6 +290,26 @@ static NSArray *SKPrimaryItems(void) {
     } @catch (id e) { return nil; }
 }
 
+// retime. Source seconds per timeline second for a retimed item (1 for everything else).
+static BOOL SKUntimedClippedStart(id clip, double *start) {
+    CMTimeRange u;
+    if (SKInvokeRange(clip, @"untimedClippedRange", nil, &u) && CMTIME_IS_NUMERIC(u.start)) { *start = CMTimeGetSeconds(u.start); return YES; }
+    return NO;
+}
+static double SKClipRate(id clip) {
+    @try {
+        SEL rs = NSSelectorFromString(@"isRetimed");
+        if (![clip respondsToSelector:rs] || !((BOOL(*)(id,SEL))objc_msgSend)(clip, rs)) return 1;
+        CMTimeRange c, u;
+        if (SKInvokeRange(clip, @"clippedRange", nil, &c) && SKInvokeRange(clip, @"untimedClippedRange", nil, &u)
+            && CMTIME_IS_NUMERIC(c.duration) && CMTIME_IS_NUMERIC(u.duration) && CMTimeGetSeconds(c.duration) > 0) {
+            double r = CMTimeGetSeconds(u.duration) / CMTimeGetSeconds(c.duration);
+            if (r > 0.01 && r < 100 && fabs(r - 1) > 1e-4) return r;
+        }
+    } @catch (id e) {}
+    return 1;
+}
+
 // Where a primary-storyline clip sits: its start on the timeline, and where its trim begins in
 // the media. FCP's transcript word times count from the start of the file, while a clip's
 // ranges are in its own time, which starts at the camera timecode (e.g. 19:14:00:00); the
@@ -306,6 +326,14 @@ static BOOL SKClipPlacement(id clip, double *tlStart, double *trimStart, double 
         *tlStart = CMTimeGetSeconds(eff.start);
         *duration = CMTimeGetSeconds(eff.duration);
         *trimStart = CMTimeGetSeconds(clipped.start) - CMTimeGetSeconds(unclipped.start);
+        // a retimed item (e.g. 25 fps media conformed into a 24 fps project plays 25/24 fast)
+        // keeps clippedRange/unclippedRange in timeline-speed time, but media and transcripts are in
+        // source time: take the trim from the untimed ranges (the rate comes from SKClipRate).
+        double rate = SKClipRate(clip), us = 0;
+        if (rate != 1 && SKUntimedClippedStart(clip, &us)) {
+            CMTimeRange uu = kCMTimeRangeZero;
+            if (SKInvokeRange(clip, @"untimedUnclippedRange", nil, &uu) && CMTIME_IS_NUMERIC(uu.start)) *trimStart = us - CMTimeGetSeconds(uu.start);
+        }
         return *duration > 0;
     } @catch (id e) { TLog(@"placement threw %@", e); return NO; }
 }
@@ -425,6 +453,87 @@ static NSArray *SKAssetsForItem(id item) {
     if (![item respondsToSelector:NSSelectorFromString(@"assets")]) return @[];
     id a = [item valueForKey:@"assets"];
     return [a isKindOfClass:[NSSet class]] ? [(NSSet *)a allObjects] : @[];
+}
+
+// synced clips. A multi-asset clip (camera file + recorder WAV) holds each file at its own
+// place; FCP's word times count from the start of THAT file. Find the media component that holds
+// `asset` and return where second 0 of its file lands in the outer clip's time base.
+static NSString *SKMediaPath(id asset);
+static BOOL SKFindComponentForAsset(id node, id asset, int depth, id *found) {
+    if (!node || depth > 6) return NO;
+    @try {
+        NSString *cn = NSStringFromClass([node class]);
+        if ([cn containsString:@"MediaComponent"]) {
+            NSArray *as = SKAssetsForItem(node);
+            if ([as containsObject:asset]) { *found = node; return YES; }
+        }
+        for (NSString *key in @[@"containedItems", @"anchoredItems"]) {
+            if (![node respondsToSelector:NSSelectorFromString(key)]) continue;
+            id items = [node valueForKey:key];
+            if (![items isKindOfClass:[NSArray class]] && ![items isKindOfClass:[NSSet class]]) continue;
+            for (id c in items) if (SKFindComponentForAsset(c, asset, depth + 1, found)) return YES;
+        }
+    } @catch (id e) {}
+    return NO;
+}
+static BOOL SKAssetOriginInClip(id clip, id asset, double *origin) {
+    static NSMapTable *cache;   // clip -> (asset -> NSNumber or NSNull)
+    if (!cache) cache = [NSMapTable weakToStrongObjectsMapTable];
+    NSMapTable *per = [cache objectForKey:clip];
+    if (!per) { per = [NSMapTable weakToStrongObjectsMapTable]; [cache setObject:per forKey:clip]; }
+    id hit = [per objectForKey:asset];
+    if (hit) { if ([hit isKindOfClass:[NSNull class]]) return NO; *origin = [hit doubleValue]; return YES; }
+    BOOL ok = NO; double val = 0;
+    @try {
+        id root = clip;
+        if ([clip respondsToSelector:NSSelectorFromString(@"primaryObject")]) {
+            id p = [clip valueForKey:@"primaryObject"];
+            if (p) root = p;
+        }
+        id comp = nil;
+        if (SKFindComponentForAsset(root, asset, 0, &comp) && comp) {
+            CMTimeRange un = kCMTimeRangeZero;
+            if (SKInvokeRange(comp, @"unclippedRange", nil, &un) && CMTIME_IS_NUMERIC(un.start)) {
+                // file start (the component's local time) plus the local-to-parent offset of the
+                // component and of every ancestor below the outer item (the item's own offset, and its
+                // retime, are the item's business: they map timeline time, not where media sits in it).
+                SEL ltop = NSSelectorFromString(@"localToParentOffset"), pi = NSSelectorFromString(@"parentItem");
+                double base = CMTimeGetSeconds(un.start), off = 0;
+                BOOL reached = NO;
+                NSMutableString *chain = [NSMutableString string];
+                id n = comp;
+                for (int d = 0; n && d < 16; d++) {
+                    if (n == clip || n == root) { reached = YES; break; }
+                    if ([n respondsToSelector:ltop]) {
+                        CMTime o = ((CMTime(*)(id,SEL))objc_msgSend)(n, ltop);
+                        if (CMTIME_IS_NUMERIC(o)) { off += CMTimeGetSeconds(o); [chain appendFormat:@" %@%+.6f", [n respondsToSelector:NSSelectorFromString(@"displayName")] ? [n valueForKey:@"displayName"] : @"?", CMTimeGetSeconds(o)]; }
+                    }
+                    n = [n respondsToSelector:pi] ? ((id(*)(id,SEL))objc_msgSend)(n, pi) : nil;
+                }
+                if (!reached) {   // not a descendant by parentItem: use the component's own offset only
+                    off = 0;
+                    if ([comp respondsToSelector:ltop]) { CMTime o = ((CMTime(*)(id,SEL))objc_msgSend)(comp, ltop); if (CMTIME_IS_NUMERIC(o)) off = CMTimeGetSeconds(o); }
+                }
+                val = base + off;
+                ok = YES;
+                double cstart = 0; CMTimeRange cr;
+                if (SKInvokeRange(clip, @"clippedRange", nil, &cr)) cstart = CMTimeGetSeconds(cr.start);
+                double ustart = cstart;
+                SKUntimedClippedStart(clip, &ustart);
+                TLog(@"asset origin: %@ in %@ = %.4f (file start %.6f + offsets%@ = %+.6f, chain %@; clip start %.4f, untimed %.4f, rate %.5f)", SKMediaPath(asset).lastPathComponent,
+                     [clip respondsToSelector:NSSelectorFromString(@"displayName")] ? [clip valueForKey:@"displayName"] : [clip class], val, base,
+                     reached ? @"" : @" (own only)", off, chain, cstart, ustart, SKClipRate(clip));
+            }
+        }
+    } @catch (id e) { ok = NO; }
+    [per setObject:ok ? (id)@(val) : (id)[NSNull null] forKey:asset];
+    if (ok) *origin = val;
+    return ok;
+}
+static BOOL SKAssetHasVideo(id asset) {
+    SEL s = NSSelectorFromString(@"videoSourceCount");
+    if (![asset respondsToSelector:s]) return YES;
+    return ((long(*)(id,SEL))objc_msgSend)(asset, s) > 0;
 }
 
 // FCP's stored transcript for an asset, else one we generated this session, else nil.
@@ -1797,7 +1906,7 @@ static BOOL SKIsFiller(NSString *text) {
         for (id c in clips) {
             double a = 0, t = 0, d = 0;
             BOOL ok = sequenceMode && SKClipPlacement(c, &a, &t, &d);
-            [entries addObject:ok ? @{@"clip": c, @"tl": @(a), @"trim": @(t), @"dur": @(d)} : @{@"clip": c}];
+            [entries addObject:ok ? @{@"clip": c, @"tl": @(a), @"trim": @(t), @"dur": @(d), @"rate": @(SKClipRate(c))} : @{@"clip": c}];
         }
         if (sequenceMode && connected.count) {
             for (NSDictionary *c in connected) { NSMutableDictionary *m = [c mutableCopy]; m[@"conn"] = @YES; [entries addObject:m]; }
@@ -1816,7 +1925,9 @@ static BOOL SKIsFiller(NSString *text) {
             id clip = entry[@"clip"];
             BOOL isConn = [entry[@"conn"] boolValue];
             BOOL placed = sequenceMode && entry[@"tl"] != nil;
-            double tlStart = [entry[@"tl"] doubleValue], trimStart = [entry[@"trim"] doubleValue], clipDur = [entry[@"dur"] doubleValue];
+            double tlStart = [entry[@"tl"] doubleValue], trimStart0 = [entry[@"trim"] doubleValue], clipDur = [entry[@"dur"] doubleValue];
+            double rate = [entry[@"rate"] doubleValue]; if (rate <= 0) rate = 1;   // source seconds per timeline second
+            double srcDur = clipDur * rate;
             CMTimeRange clipRange = kCMTimeRangeZero;
             CMTime clipFrame = CMTimeMake(1, 600);
             if (!sequenceMode) {
@@ -1829,9 +1940,30 @@ static BOOL SKIsFiller(NSString *text) {
             if (placed && !isConn) timelineEnd = MAX(timelineEnd, tlStart + clipDur);
             NSArray *assets = SKAssetsForItem(clip);
             if (assets.count == 0) continue;   // gaps, generators: their time shows up as a pause
-            for (id asset in assets) {
+            // multi-asset (synced) clips: show one asset's text (audio-only ones first) and don't
+            // prompt for transcripts of the others when one has words.
+            BOOL multi = assets.count > 1;
+            NSArray *useAssets = assets;
+            if (multi) {
+                NSMutableArray *withWords = [NSMutableArray array], *audioOnly = [NSMutableArray array];
+                for (id a in assets) if (SKPhrasesForAsset(a)) { [withWords addObject:a]; if (!SKAssetHasVideo(a)) [audioOnly addObject:a]; }
+                if (withWords.count) useAssets = audioOnly.count ? audioOnly : withWords;
+            }
+            for (id asset in useAssets) {
                 NSArray<NSArray<SKRawWord *> *> *rawPhrases = SKPhrasesForAsset(asset);
                 if (!rawPhrases) { [missingAssets addObject:asset]; if (![missingClips containsObject:clip]) [missingClips addObject:clip]; continue; }
+                double trimStart = trimStart0;
+                CMTime originTime = clipRange.start;
+                if (multi) {
+                    double org;
+                    if (SKAssetOriginInClip(clip, asset, &org)) {
+                        CMTimeRange cr = kCMTimeRangeZero; SKInvokeRange(clip, @"clippedRange", nil, &cr);
+                        double cs0 = CMTimeGetSeconds(cr.start);
+                        if (rate != 1) SKUntimedClippedStart(clip, &cs0);   // retimed: media time, not timeline-speed time
+                        trimStart = cs0 - org;
+                        originTime = CMTimeMakeWithSeconds(org, clipRange.start.timescale > 0 ? clipRange.start.timescale : 24000);
+                    }
+                }
                 NSString *path = SKMediaPath(asset);
                 if (path) {
                     [mediaPaths addObject:path];
@@ -1851,19 +1983,19 @@ static BOOL SKIsFiller(NSString *text) {
                         NSArray *crow = (placed && rw.pk >= 0 && rw.pk < (NSInteger)[entry[@"words"] count]) ? entry[@"words"][rw.pk] : nil;
                         if (crow.count >= 6 && [crow[5] doubleValue] > [crow[4] doubleValue]) {
                             double cs = [crow[4] doubleValue], ce = [crow[5] doubleValue];
-                            double ck = MIN(ce, trimStart + clipDur) - MAX(cs, trimStart);
+                            double ck = MIN(ce, trimStart + srcDur) - MAX(cs, trimStart);
                             if (ck < MIN(0.10, 0.6 * (ce - cs)) - 1e-4) continue;   // trimmed away
-                        } else if (placed) { double kept = MIN(e, trimStart + clipDur) - MAX(s, trimStart);
-                            if (kept < MIN(0.06, (e - s) / 2) - 1e-4 || (e - s < 1e-4 && (s < trimStart - 0.001 || s >= trimStart + clipDur - 0.001))) continue; }   // trimmed away
+                        } else if (placed) { double kept = MIN(e, trimStart + srcDur) - MAX(s, trimStart);
+                            if (kept < MIN(0.06, (e - s) / 2) - 1e-4 || (e - s < 1e-4 && (s < trimStart - 0.001 || s >= trimStart + srcDur - 0.001))) continue; }   // trimmed away
                         SKWord *word = [SKWord new];
                         word.srcStart = s; word.srcEnd = e; word.origStart = rw.os; word.origEnd = rw.oe; word.mediaPath = path;
-                        if (!sequenceMode) { word.sourceClip = clip; word.clipOrigin = clipRange.start; word.clipFrame = clipFrame; }
+                        if (!sequenceMode) { word.sourceClip = clip; word.clipOrigin = originTime; word.clipFrame = clipFrame; }
                         word.original = t;
                         word.corrKey = rw.key;
                         NSString *fixed = corrections[rw.key ?: [NSString stringWithFormat:@"%.3f", rw.os]];
                         word.text = fixed ?: t;
-                        word.tlStart = placed ? tlStart + MAX(s - trimStart, 0) : NAN;
-                        word.tlEnd = placed ? MIN(tlStart + (e - trimStart), tlStart + clipDur) : NAN;
+                        word.tlStart = placed ? tlStart + MAX(s - trimStart, 0) / rate : NAN;
+                        word.tlEnd = placed ? MIN(tlStart + (e - trimStart) / rate, tlStart + clipDur) : NAN;
                         word.filler = SKIsFiller(word.text);
                         NSString *sid = entry ? SKSpeakerIDAt(entry, (rw.os + rw.oe) / 2) : nil;
                         word.speaker = sid ? SKSpeakerName(entry, sid) : nil;
@@ -1904,7 +2036,7 @@ static BOOL SKIsFiller(NSString *text) {
                             if (tcW > 0) {
                                 // Timeline: timeline time. Browser clip: time into the media, or the clip's own timecode.
                                 NSString *tc = placed ? (tcMode == 2 ? SKTimecodeDF(word.tlStart) : SKStampText(word.tlStart, SKFrameDuration(), tcMode))
-                                                      : SKStampText(tcMode == 2 ? CMTimeGetSeconds(clipRange.start) + s : s, clipFrame, tcMode);
+                                                      : SKStampText(tcMode == 2 ? CMTimeGetSeconds(originTime) + s : s, clipFrame, tcMode);
                                 add([NSString stringWithFormat:@"\t%@\t", tc], stamp);
                             }
                             opened = YES;
@@ -4014,5 +4146,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.3.1 loaded");
+    TLog(@"Transcript Tab 1.3.2 loaded");
 }

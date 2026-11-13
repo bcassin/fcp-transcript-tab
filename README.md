@@ -67,7 +67,7 @@ SpliceKit-patched copy of Final Cut Pro.
 
 ## Install
 
-1. Download `TranscriptTab-1.3.1.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `TranscriptTab-1.3.2.zip` from the [Releases](../../releases) page and unzip it.
    You get a folder called `com.innerparakeet.transcript-tab`.
 2. Move that folder into SpliceKit's plugins folder:
    `~/Library/Application Support/SpliceKit/plugins/`
@@ -106,8 +106,9 @@ restart Final Cut Pro.
 - **Speaker labels, names and word corrections** are saved outside the library, in
   `~/Library/Application Support/SpliceKit/transcript-tab-speakers.json`. Word corrections change
   only the transcript text, never your media.
-- **Not yet tested:** multicam and compound clips, retimed clips, and projects that start at a
+- **Not yet tested:** multicam and compound clips, and projects that start at a
   timecode other than 00:00:00:00.
+- **Synchronized clips** (camera + separate audio file): the audio file's transcript shows and lines up, in the browser and in projects. Retimed or rate-conformed clips (for example 25 fps media in a 24 fps project) place words correctly.
 - **Speaker detection** works well on clean recordings; on real interviews it sometimes gives the
   interviewer's questions to the main speaker. Right-click a line to fix it.
 - **Word timing** is good but not perfect: a short "um" or "ah" the speech model never wrote down

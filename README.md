@@ -12,14 +12,14 @@ SpliceKit-patched copy of Final Cut Pro.
 ## What it does
 
 **Transcripts**
-- Starts from Final Cut Pro's own transcripts. A clip without one shows a **Transcribe** button
-  that runs FCP's built-in transcription (the same as Modify › Analyze and Fix › Transcribe) and
-  saves the result in the library.
-- **Speakers › Detect** also re-transcribes the clip with SpliceKit's Parakeet model and lines each
-  word up with the audio. After that the tab shows Parakeet's words, which keep the ums, uhs and
-  repeated words Final Cut Pro leaves out, and its word timing matches what you hear at your cuts:
-  a word you've cut off no longer shows, and one you can still hear does. Your corrections and
-  speaker names carry over. Turn either part off in the View section (Words, Word timing).
+- Shows Final Cut Pro's own transcripts, in any language Final Cut Pro transcribes. A clip without
+  one shows a **Transcribe** button that runs FCP's built-in transcription (the same as Modify ›
+  Analyze and Fix › Transcribe) in the language you pick, and saves the result in the library.
+- For English, **Speakers › Detect** also runs SpliceKit's Parakeet model in the background and lines
+  each word up with the audio, so word timing matches what you hear at your cuts: a word you've cut
+  off no longer shows, and one you can still hear does. It also puts back the ums and uhs Final Cut
+  Pro leaves out, so you can delete them. The text itself stays Final Cut Pro's. Turn the timing off
+  in View › Precise word timing.
 
 **Browser clips**
 - Click a word to move the browser playhead there.
@@ -41,25 +41,28 @@ SpliceKit-patched copy of Final Cut Pro.
 **Speakers**
 - Detect speakers with SpliceKit's built-in speaker detection (about 4 minutes for an 80-minute
   interview; reading audio from FCP's proxy media when it exists is much faster).
-- Speaker names use Final Cut Pro's role color palette, with an optional color bar beside each
-  speaker's lines. Hover a name and click the color circle to change it.
+- Each speaker gets a color of their own (kept apart from Final Cut Pro's role colors, which mean
+  Dialogue, Music and Effects), with an optional color bar beside their lines. Hover a name and
+  click the color dot to change it.
 - Double-click a name to rename it everywhere; right-click a line to assign it to another speaker.
 - Show one speaker at a time.
 
 **Find, fix and export**
 - Find & Replace (⌘F), and double-click a word to correct a transcription mistake.
 - Export a timecoded transcript (Premiere Pro's layout), a transcript grouped by speaker (one timecode per speaker turn), plain text, or SRT subtitles.
-- Create Captions puts the transcript on the timeline as Final Cut Pro captions, in one undo step.
+- The **?** button at the bottom left opens the manual.
 
 **View options**
 - Timecode style (short, minutes:seconds:frames, project timecode, or hidden), transcript text
-  size, color bars, a darker background, and whether to use Parakeet's words and timing. Every section folds away like FCP's own inspectors.
+  size, color bars, a darker background, and precise word timing. The panel is laid out like Final
+  Cut Pro's own inspectors, and every section folds away.
 
 ## Requirements
 
-- Final Cut Pro **12.4** patched with **SpliceKit 3.3.9**. Transcript Tab uses Final Cut Pro's
-  private classes, so other versions of FCP or SpliceKit may need changes.
-- macOS 14 or later, Apple silicon or Intel. Speaker detection and Parakeet's words need Apple
+- Final Cut Pro **13.0** patched with **SpliceKit 3.3.9** (1.3.2 was the last release tested on
+  FCP 12.4). Transcript Tab uses Final Cut Pro's private classes, so other versions of FCP or
+  SpliceKit may need changes.
+- macOS 14 or later, Apple silicon or Intel. Speaker detection and precise word timing need Apple
   silicon (SpliceKit's Parakeet tools are Apple silicon only).
 - Word alignment uses the small Parakeet CTC model that SpliceKit's speech tools keep in
   `~/Library/Application Support/FluidAudio/Models/parakeet-ctc-110m-coreml`. Without it, Detect
@@ -67,7 +70,7 @@ SpliceKit-patched copy of Final Cut Pro.
 
 ## Install
 
-1. Download `TranscriptTab-1.3.2.zip` from the [Releases](../../releases) page and unzip it.
+1. Download `TranscriptTab-1.4.0.zip` from the [Releases](../../releases) page and unzip it.
    You get a folder called `com.innerparakeet.transcript-tab`.
 2. Move that folder into SpliceKit's plugins folder:
    `~/Library/Application Support/SpliceKit/plugins/`

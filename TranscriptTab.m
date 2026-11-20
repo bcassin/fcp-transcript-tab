@@ -5,6 +5,7 @@
 #import <dlfcn.h>
 #import <AppKit/AppKit.h>
 #import <CoreMedia/CoreMedia.h>
+#import <NaturalLanguage/NaturalLanguage.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -52,8 +53,7 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic) BOOL filler;             // um / uh and friends
 @property (nonatomic, copy) NSString *speaker;   // display name, nil when unknown
 @property (nonatomic, copy) NSString *mediaPath; // source file the word comes from
-@property (nonatomic, copy) NSString *original;  // the transcript's text for the word (FCP's, or Parakeet's since v82)
-@property (nonatomic, copy) NSString *corrKey;   // correction key when not FCP's start time (words only Parakeet has)
+@property (nonatomic, copy) NSString *original;  // the transcript's text for the word (always FCP's since v104)
 @property (nonatomic, copy) NSString *text;      // what we show: the original or a correction
 @property (nonatomic) BOOL paragraphStart;       // first word of a phrase paragraph
 @property (nonatomic, strong) id sourceClip;     // browser clip the word belongs to (source view only)
@@ -65,6 +65,68 @@ static CMTimeRange SKTimeRange(id obj) {
 @end
 
 @class SKInspectorModuleTranscript;
+@interface SKSelectionLayoutManager : NSLayoutManager
+@property (nonatomic, weak) NSTextView *selView;
+@property (nonatomic) CGFloat textLeft;   // x of the text column (container coordinates); the selection never starts left of it
+@end
+@implementation SKSelectionLayoutManager
+// v119: the selection is painted here, per line from the first to the last selected glyph, in FCP's
+// slate-blue; wrapped lines no longer start in the timecode gutter, and it looks the same focused or not.
+- (BOOL)sk_isSystemSelectionColor:(NSColor *)c {
+    if (!c) return NO;
+    for (NSColor *sc in @[NSColor.selectedTextBackgroundColor, NSColor.unemphasizedSelectedTextBackgroundColor]) {
+        NSColor *x = [c colorUsingColorSpace:NSColorSpace.sRGBColorSpace], *y = [sc colorUsingColorSpace:NSColorSpace.sRGBColorSpace];
+        if (x && y && fabs(x.redComponent - y.redComponent) < 0.01 && fabs(x.greenComponent - y.greenComponent) < 0.01 &&
+            fabs(x.blueComponent - y.blueComponent) < 0.01 && fabs(x.alphaComponent - y.alphaComponent) < 0.01) return YES;
+    }
+    return NO;
+}
+// Skip the system's own selection fills (focused or not); the selection is drawn in drawBackgroundForGlyphRange.
+- (void)fillBackgroundRectArray:(const NSRect *)rects count:(NSUInteger)n forCharacterRange:(NSRange)cr color:(NSColor *)color {
+    if ([self sk_isSystemSelectionColor:color]) return;
+    [super fillBackgroundRectArray:rects count:n forCharacterRange:cr color:color];
+}
+- (void)drawBackgroundForGlyphRange:(NSRange)glyphsToShow atPoint:(NSPoint)origin {
+    [super drawBackgroundForGlyphRange:glyphsToShow atPoint:origin];
+    NSTextView *tv = self.selView;
+    NSRange sel = tv.selectedRange;
+    if (!tv || sel.length == 0) return;
+    // v123: one block like a macOS text selection: middle lines run from the text column to the right
+    // edge, the first line starts at the first selected word, the last line ends at the last one, and
+    // each line reaches down to the next (no gaps, no stair steps).
+    NSRange gsel = [self glyphRangeForCharacterRange:sel actualCharacterRange:NULL];
+    if (gsel.length == 0 || NSIntersectionRange(gsel, glyphsToShow).length == 0) return;
+    NSMutableArray<NSValue *> *lines = [NSMutableArray array];
+    __block CGFloat rightEdge = 0;
+    [self enumerateLineFragmentsForGlyphRange:gsel usingBlock:^(NSRect r, NSRect used, NSTextContainer *tc, NSRange lg, BOOL *stop) {
+        NSRange part = NSIntersectionRange(lg, gsel);
+        if (part.length == 0) return;
+        NSRect b = [self boundingRectForGlyphRange:part inTextContainer:tc];
+        rightEdge = tc.size.width - tc.lineFragmentPadding;
+        [lines addObject:[NSValue valueWithRect:NSMakeRect(b.origin.x, r.origin.y, NSMaxX(b), NSMaxY(r))]];   // x0, y0, x1, y1
+    }];
+    if (!lines.count) return;
+    [[NSColor colorWithSRGBRed:0x53/255.0 green:0x5F/255.0 blue:0x7D/255.0 alpha:1] setFill];
+    CGFloat left = self.textLeft;
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        NSRect v = lines[i].rectValue;
+        CGFloat x0 = i == 0 ? MAX(left, v.origin.x) : left;
+        CGFloat x1 = i + 1 == lines.count ? MAX(x0, v.size.width) : MAX(rightEdge, x0);
+        CGFloat y0 = v.origin.y, y1 = i + 1 < lines.count ? lines[i + 1].rectValue.origin.y : v.size.height;
+        if (x1 <= x0 || y1 <= y0) continue;
+        NSRectFill(NSMakeRect(x0 + origin.x, y0 + origin.y, x1 - x0, y1 - y0));
+    }
+}
+@end
+
+// v124: help + Export live in FCP's own inspector footer bar (FFInspectorTabModule moduleFooterAccessoryView,
+// an empty 28 pt view for our tab), not in a second bar of ours. The host stays in that view; its contents
+// show only while the Transcript tab is on screen with a transcript (checked before each draw, no flicker).
+@interface SKFooterHost : NSView
+@property (nonatomic, weak) id module;
+- (BOOL)sk_shouldShow;
+@end
+
 @interface SKTranscriptTextView : NSTextView
 @property (nonatomic, weak) SKInspectorModuleTranscript *module;
 - (BOOL)sk_handleClickAtViewPoint:(NSPoint)p;
@@ -77,6 +139,7 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic, weak) id owner;
 @property (nonatomic, strong) NSTextField *titleLabel, *hideLabel;
 @property (nonatomic) BOOL collapsed;
+@property (nonatomic) BOOL topLine;           // v110: 2 px #2D2D2D separator above the header (not on the first)
 @end
 
 // Speaker color picker (v64), drawn like FCP's role color picker: a dark rounded panel with a
@@ -91,7 +154,9 @@ static CMTimeRange SKTimeRange(id obj) {
 @interface SKFillView : NSView
 @property (nonatomic, strong) NSColor *fill;
 @property (nonatomic) CGFloat rowHeight;     // > 0: draw a separator between rows of this height
-@property (nonatomic) BOOL topLine;          // a dark hairline along the top edge
+@property (nonatomic) BOOL topLine;          // a line along the top edge
+@property (nonatomic, strong) NSColor *lineColor;   // v110: its color (default #141414)
+@property (nonatomic) CGFloat lineHeight;           // v110: its thickness (default 1)
 @end
 
 @interface SKInspectorModuleTranscript : FFInspectorModule <NSTextFieldDelegate, NSSearchFieldDelegate>
@@ -115,16 +180,24 @@ static CMTimeRange SKTimeRange(id obj) {
 @property (nonatomic, strong) NSArray<NSArray *> *labelRanges; // @[NSValue range, name] for each speaker label drawn
 @property (nonatomic, strong) NSPopUpButton *exportPopup;
 @property (nonatomic, strong) NSButton *captionsButton;
+@property (nonatomic, strong) NSButton *helpButton;
 @property (nonatomic, strong) NSButton *transcribeButton;   // under the "no transcript yet" line (v62)
 @property (nonatomic, strong) NSSegmentedControl *sizeControl;
 @property (nonatomic, strong) NSPopUpButton *thresholdPopup;
 @property (nonatomic, strong) NSArray<NSDictionary *> *sections;   // @{id, header, box?, rows?} top to bottom (v63)
 @property (nonatomic, strong) SKFillView *footer;
 @property (nonatomic, strong) NSStackView *footerStack;
+@property (nonatomic, strong) NSView *footerHost;
+- (BOOL)sk_isShowing;
 @property (nonatomic, strong) NSPopUpButton *timecodePopup;
 @property (nonatomic, strong) NSButton *barsCheckbox;
 @property (nonatomic, strong) NSButton *timingCheckbox;   // View › Word timing (v81)
-@property (nonatomic, strong) NSButton *wordsCheckbox;    // View › Words: Parakeet (v82)
+@property (nonatomic, strong) NSView *emptyView;                // v110: the no-transcript / transcribing / failed view
+@property (nonatomic, strong) NSImageView *emptyIcon;
+@property (nonatomic, strong) NSTextField *emptyTitleLabel, *emptyBodyLabel;
+@property (nonatomic, strong) NSProgressIndicator *emptySpinner;
+@property (nonatomic) NSInteger emptyKind;                       // 0 none, 1 no transcript, 2 transcribing, 3 failed
+@property (nonatomic, strong) NSPopUpButton *languagePopup;   // Transcript › Language (v104)
 @property (nonatomic, strong) NSButton *darkCheckbox;   // View › Background: dark instead of the row gray (v74)
 @property (nonatomic, strong) NSArray<NSArray *> *blocks;        // @[NSValue range name…last word, NSColor] per speaker run
 @property (nonatomic, strong) NSArray<NSValue *> *pauseRanges;   // pause items, drawn as capsules
@@ -165,6 +238,7 @@ static CMTimeRange SKTimeRange(id obj) {
 - (SKWord *)sk_wordAtIndex:(NSUInteger)idx;
 - (BOOL)sk_export:(NSInteger)kind toPath:(NSString *)path;
 - (BOOL)sk_createCaptions:(id)sender;
+- (void)sk_openManual:(id)sender;
 - (BOOL)sk_seekSourceWord:(SKWord *)w;
 - (BOOL)sk_markSourceSelection;
 - (void)sk_updateSourceButtons;
@@ -290,7 +364,7 @@ static NSArray *SKPrimaryItems(void) {
     } @catch (id e) { return nil; }
 }
 
-// retime. Source seconds per timeline second for a retimed item (1 for everything else).
+// v103: retime. Source seconds per timeline second for a retimed item (1 for everything else).
 static BOOL SKUntimedClippedStart(id clip, double *start) {
     CMTimeRange u;
     if (SKInvokeRange(clip, @"untimedClippedRange", nil, &u) && CMTIME_IS_NUMERIC(u.start)) { *start = CMTimeGetSeconds(u.start); return YES; }
@@ -326,7 +400,7 @@ static BOOL SKClipPlacement(id clip, double *tlStart, double *trimStart, double 
         *tlStart = CMTimeGetSeconds(eff.start);
         *duration = CMTimeGetSeconds(eff.duration);
         *trimStart = CMTimeGetSeconds(clipped.start) - CMTimeGetSeconds(unclipped.start);
-        // a retimed item (e.g. 25 fps media conformed into a 24 fps project plays 25/24 fast)
+        // v103: a retimed item (e.g. 25 fps media conformed into a 24 fps project plays 25/24 fast)
         // keeps clippedRange/unclippedRange in timeline-speed time, but media and transcripts are in
         // source time: take the trim from the untimed ranges (the rate comes from SKClipRate).
         double rate = SKClipRate(clip), us = 0;
@@ -360,7 +434,7 @@ static BOOL SKCallBool(id obj, NSString *sel) {
 }
 // Connected clips (and clips inside connected storylines) with media that overlap a primary gap,
 // each as @{clip, tl, trim, dur} in timeline seconds (trim = where the visible part starts in the media).
-// Is this item anywhere in the open timeline — primary, connected to a primary item, or
+// v101: is this item anywhere in the open timeline — primary, connected to a primary item, or
 // inside a connected storyline? Inspector items that are (a camera angle connected on top, a
 // title…) keep the timeline view; before, only connected clips over gaps did, so a connected
 // angle under the playhead flipped the tab to that clip's own transcript, and a text selection
@@ -455,7 +529,7 @@ static NSArray *SKAssetsForItem(id item) {
     return [a isKindOfClass:[NSSet class]] ? [(NSSet *)a allObjects] : @[];
 }
 
-// synced clips. A multi-asset clip (camera file + recorder WAV) holds each file at its own
+// v102: synced clips. A multi-asset clip (camera file + recorder WAV) holds each file at its own
 // place; FCP's word times count from the start of THAT file. Find the media component that holds
 // `asset` and return where second 0 of its file lands in the outer clip's time base.
 static NSString *SKMediaPath(id asset);
@@ -494,7 +568,7 @@ static BOOL SKAssetOriginInClip(id clip, id asset, double *origin) {
         if (SKFindComponentForAsset(root, asset, 0, &comp) && comp) {
             CMTimeRange un = kCMTimeRangeZero;
             if (SKInvokeRange(comp, @"unclippedRange", nil, &un) && CMTIME_IS_NUMERIC(un.start)) {
-                // file start (the component's local time) plus the local-to-parent offset of the
+                // v103: file start (the component's local time) plus the local-to-parent offset of the
                 // component and of every ancestor below the outer item (the item's own offset, and its
                 // retime, are the item's business: they map timeline time, not where media sits in it).
                 SEL ltop = NSSelectorFromString(@"localToParentOffset"), pi = NSSelectorFromString(@"parentItem");
@@ -566,7 +640,6 @@ static id SKTranscriptForAsset(id asset) {
 @property (nonatomic) double s, e;     // times in use (Parakeet's when re-timed)
 @property (nonatomic) double os, oe;   // FCP's own times
 @property (nonatomic) NSInteger pk;    // matched Parakeet word (index into the speaker file's words), -1 = none
-@property (nonatomic, copy) NSString *key;   // correction key when not FCP's start time (Parakeet-only words, v82)
 @end
 @implementation SKRawWord
 @end
@@ -581,7 +654,6 @@ static void SKClearAssetCaches(void) { gPhraseCache = nil; }
 // unmatched word is moved by the offset of its matched neighbours. The text stays FCP's.
 static NSDictionary *SKSpeakerEntryForPath(NSString *path);
 static BOOL SKPreciseTiming(void);
-static BOOL SKParakeetText(void);
 static NSString *SKNormWord(NSString *s) {
     NSMutableString *o = [NSMutableString string];
     for (NSUInteger i = 0; i < s.length; i++) {
@@ -664,99 +736,59 @@ static void SKRetimeWithParakeet(NSArray<NSArray<SKRawWord *> *> *phrases, NSStr
     TLog(@"retimed %@: %lu of %lu words matched to Parakeet", path.lastPathComponent, (unsigned long)matched, (unsigned long)total);
 }
 
-// v82: show Parakeet's words (stored by Detect speakers) instead of FCP's. Apple's transcript drops
-// fillers, repeats and false starts and mishears names and terms; Parakeet keeps what was said.
-// FCP's phrases still set the paragraphs. A Parakeet word matched to an FCP word (same text, see
-// SKRetimeWithParakeet) takes that word's FCP times as its key, so corrections and speaker overrides
-// made before still apply. A run of FCP words with no match is replaced by the Parakeet words there,
-// unless one of them has a correction: then FCP's run, corrected, stays and those Parakeet words are
-// left out. Words only Parakeet has get FCP-equivalent times (their neighbour's offset) and a
-// correction key of their own ("p" + Parakeet start).
-static NSArray<NSArray<SKRawWord *> *> *SKUseParakeetText(NSArray<NSArray<SKRawWord *> *> *phrases, NSString *path) {
-    NSDictionary *entry = SKSpeakerEntryForPath(path);
-    NSArray *rows = entry[@"words"];
-    if (rows.count == 0 || [rows.firstObject count] < 4) return phrases;   // detected before v81: no text
-    NSDictionary *corr = [entry[@"corrections"] isKindOfClass:[NSDictionary class]] ? entry[@"corrections"] : @{};
-    NSUInteger n = rows.count;
+// v106: Apple's English transcript drops um/uh (2 in a whole radio edit vs Parakeet's 675), so
+// they could not be seen or deleted. Each Parakeet filler (from Detect) that no FCP word matched and
+// that doesn't sit on an FCP word is added, in time order, to the phrase of the FCP word before it.
+// It keeps Parakeet's (tightened) times and its row (pk, for the main-sound edge rule); its FCP-
+// equivalent time (os, the correction key) uses the offset of the FCP word before it.
+static BOOL SKIsFiller(NSString *text);
+static void SKAddParakeetFillers(NSMutableArray<NSMutableArray<SKRawWord *> *> *phrases, NSString *path) {
+    NSArray *rows = SKSpeakerEntryForPath(path)[@"words"];
+    if (rows.count == 0 || [rows.firstObject count] < 4) return;
     NSMutableArray<SKRawWord *> *flat = [NSMutableArray array];
     NSMutableArray<NSNumber *> *phraseOf = [NSMutableArray array];
-    for (NSUInteger p = 0; p < phrases.count; p++) for (SKRawWord *w in phrases[p]) { [flat addObject:w]; [phraseOf addObject:@(p)]; }
-    NSUInteger m = flat.count;
-    // 1. Unmatched FCP runs holding a correction stay; mark the Parakeet words they cover.
-    BOOL *keep = calloc(MAX(m, 1), sizeof(BOOL));
-    NSMutableIndexSet *covered = [NSMutableIndexSet indexSet];
-    for (NSUInteger a = 0; a < m; ) {
-        if (flat[a].pk >= 0) { a++; continue; }
-        NSUInteger b = a; while (b < m && flat[b].pk < 0) b++;
-        BOOL corrected = NO;
-        for (NSUInteger i = a; i < b; i++) if (corr[[NSString stringWithFormat:@"%.3f", flat[i].os]]) corrected = YES;
-        if (corrected) {
-            double lo = flat[a].s, hi = MAX(flat[b - 1].e, flat[b - 1].s);
-            NSInteger from = a > 0 ? flat[a - 1].pk + 1 : 0, to = b < m ? flat[b].pk : (NSInteger)n;
-            for (NSInteger k = from; k < to; k++)
-                if ([rows[k][1] doubleValue] > lo && [rows[k][0] doubleValue] < hi) [covered addIndex:k];
-            for (NSUInteger i = a; i < b; i++) keep[i] = YES;
-        }
-        a = b;
+    NSMutableIndexSet *used = [NSMutableIndexSet indexSet];
+    for (NSUInteger p = 0; p < phrases.count; p++) for (SKRawWord *w in phrases[p]) {
+        [flat addObject:w]; [phraseOf addObject:@(p)];
+        if (w.pk >= 0) [used addIndex:w.pk];
     }
-    // 2. Walk FCP's words in order, putting Parakeet's words in their place.
-    NSMutableArray<NSMutableArray<SKRawWord *> *> *out = [NSMutableArray array];
-    for (NSUInteger p = 0; p < MAX(phrases.count, 1); p++) [out addObject:[NSMutableArray array]];
-    double off = 0;   // Parakeet time minus FCP time at the last matched word
-    for (SKRawWord *w in flat) if (w.pk >= 0) { off = w.s - w.os; break; }
-    NSUInteger next = 0, matched = 0, added = 0, kept = 0;
-    NSInteger curPhrase = 0; double lastEnd = -INFINITY;
-    SKRawWord *(^pword)(NSUInteger) = ^SKRawWord *(NSUInteger k) {
-        NSArray *r = rows[k]; SKRawWord *x = [SKRawWord new];
-        x.text = [r[3] isKindOfClass:[NSString class]] ? [r[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
-        if ([x.text hasSuffix:@".."] && ![x.text hasSuffix:@"..."]) x.text = [x.text substringToIndex:x.text.length - 1];   // Parakeet's rare "set.."
-        x.s = [r[0] doubleValue]; x.e = MAX([r[1] doubleValue], x.s); x.pk = k;
-        return x;
-    };
-    // A Parakeet-only word goes to the phrase being written if it is nearer that phrase's last word
-    // than the next matched FCP word, else to that word's phrase.
-    for (NSUInteger i = 0; i <= m; i++) {
-        SKRawWord *w = i < m ? flat[i] : nil;
-        NSInteger p = i < m ? phraseOf[i].integerValue : curPhrase;
-        if (w && w.pk < 0) {
-            if (keep[i]) { [out[p] addObject:w]; kept++; curPhrase = p; lastEnd = w.e; }
+    if (!flat.count) return;
+    NSUInteger added = 0, skipped = 0;
+    for (NSUInteger k = 0; k < rows.count; k++) {
+        NSArray *r = rows[k];
+        if (![r[3] isKindOfClass:[NSString class]] || !SKIsFiller(r[3])) continue;
+        if ([used containsIndex:k]) {
+            for (SKRawWord *w in flat) if (w.pk == (NSInteger)k) { if (skipped + added < 20) TLog(@"fillers: '%@' %.2f already in FCP's text as '%@'", r[3], [r[0] doubleValue], w.text); break; }
             continue;
         }
-        NSUInteger upTo = w ? (NSUInteger)w.pk : n;
-        for (; next < upTo; next++) {
-            if ([covered containsIndex:next]) continue;
-            SKRawWord *x = pword(next);
-            if (!x.text.length) continue;
-            x.os = x.s - off; x.oe = x.e - off; x.key = [NSString stringWithFormat:@"p%.3f", x.s];
-            NSInteger q = (w && p != curPhrase && x.s - lastEnd >= w.s - x.e) ? p : curPhrase;
-            if (lastEnd == -INFINITY) q = p;
-            [out[q] addObject:x]; added++; curPhrase = q; lastEnd = x.e;
+        double s = [r[0] doubleValue], e = MAX([r[1] doubleValue], s);
+        // Last FCP word starting at or before the filler (binary search; flat is in time order).
+        NSInteger lo = 0, hi = (NSInteger)flat.count - 1, a = -1;
+        while (lo <= hi) { NSInteger mid = (lo + hi) / 2; if (flat[mid].s <= s) { a = mid; lo = mid + 1; } else hi = mid - 1; }
+        // On top of an FCP word (more than half the filler inside it): FCP heard something there; leave it.
+        double over = 0;
+        for (NSInteger i = MAX(a, 0); i <= MIN(a + 1, (NSInteger)flat.count - 1); i++)
+            over = MAX(over, MIN(e, flat[i].e) - MAX(s, flat[i].s));
+        if (over > (e - s) / 2) {
+            if (skipped++ < 20) TLog(@"fillers: '%@' %.2f-%.2f left out, on FCP '%@' %.2f-%.2f / '%@' %.2f-%.2f", r[3], s, e,
+                                     flat[MAX(a, 0)].text, flat[MAX(a, 0)].s, flat[MAX(a, 0)].e,
+                                     flat[MIN(a + 1, (NSInteger)flat.count - 1)].text, flat[MIN(a + 1, (NSInteger)flat.count - 1)].s, flat[MIN(a + 1, (NSInteger)flat.count - 1)].e);
+            continue;
         }
-        if (!w) break;
-        SKRawWord *x = pword(w.pk);
-        next = w.pk + 1;
-        x.os = w.os; x.oe = w.oe; off = x.s - w.os;
-        [out[p] addObject:x]; matched++; curPhrase = p; lastEnd = x.e;
+        // Next to a filler FCP already has (e.g. FCP's "um," a word away that the matching paired with
+        // nothing): the same sound, don't show it twice.
+        if ((a >= 0 && SKIsFiller(flat[a].text)) || (a + 1 < (NSInteger)flat.count && SKIsFiller(flat[a + 1].text))) { skipped++; continue; }
+        SKRawWord *ref = flat[MAX(a, 0)];
+        double off = ref.s - ref.os;
+        SKRawWord *x = [SKRawWord new];
+        x.text = [r[3] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        x.s = s; x.e = e; x.os = s - off; x.oe = e - off; x.pk = k;
+        NSMutableArray *ph = phrases[phraseOf[MAX(a, 0)].integerValue];
+        NSUInteger at = 0; while (at < ph.count && ((SKRawWord *)ph[at]).s <= s) at++;
+        [ph insertObject:x atIndex:at];
+        added++;
     }
-    free(keep);
-    // 3. Paragraphs follow Parakeet's sentences (its punctuation and capitals don't line up with FCP's
-    //    phrase breaks): a new one after a word ending in . ? or !, or before a silence of 1.5 s or more.
-    NSMutableArray<SKRawWord *> *words = [NSMutableArray array];
-    for (NSArray *pw in out) [words addObjectsFromArray:pw];
-    NSMutableArray *result = [NSMutableArray array];
-    NSMutableArray *cur = [NSMutableArray array];
-    NSCharacterSet *closers = [NSCharacterSet characterSetWithCharactersInString:@"\"')]”’"];
-    for (NSUInteger i = 0; i < words.count; i++) {
-        SKRawWord *w = words[i];
-        [cur addObject:w];
-        NSString *t = [w.text stringByTrimmingCharactersInSet:closers];
-        unichar last = t.length ? [t characterAtIndex:t.length - 1] : 0;
-        BOOL end = last == '.' || last == '?' || last == '!' || i + 1 == words.count || words[i + 1].s - w.e >= 1.5;
-        if (end) { [result addObject:cur]; cur = [NSMutableArray array]; }
-    }
-    TLog(@"parakeet text %@: %lu words (%lu matched FCP, %lu only in Parakeet, %lu FCP kept for corrections; FCP had %lu)",
-         path.lastPathComponent, (unsigned long)(matched + added + kept), (unsigned long)matched, (unsigned long)added, (unsigned long)kept, (unsigned long)m);
-    return result;
+    TLog(@"fillers %@: %lu um/uh added from Parakeet (%lu left out: on or next to an FCP word/filler)", path.lastPathComponent, (unsigned long)added, (unsigned long)skipped);
 }
 
 static NSArray<NSArray<SKRawWord *> *> *SKPhrasesForAsset(id asset) {
@@ -782,9 +814,21 @@ static NSArray<NSArray<SKRawWord *> *> *SKPhrasesForAsset(id asset) {
         }
         [phrases addObject:list];
     }
-    BOOL parakeetText = SKParakeetText();
-    if (SKPreciseTiming() || parakeetText) SKRetimeWithParakeet(phrases, SKMediaPath(asset));
-    if (parakeetText) phrases = [SKUseParakeetText(phrases, SKMediaPath(asset)) mutableCopy];
+    // v104-v106: the text is FCP's. For English transcripts only (the CTC aligner is English-only and
+    // the matching was tuned on English), Detect's Parakeet words tighten the word times and put back
+    // the um/uh Apple leaves out. Other languages keep FCP's words and times as they are.
+    NSMutableString *sample = [NSMutableString string];
+    for (NSArray<SKRawWord *> *pw in phrases) { for (SKRawWord *w in pw) { [sample appendString:w.text]; [sample appendString:@" "]; } if (sample.length > 2000) break; }
+    NLLanguageRecognizer *rec = [NLLanguageRecognizer new];
+    [rec processString:sample];
+    NSString *lang = rec.dominantLanguage;
+    NSString *path = SKMediaPath(asset);
+    if ([lang isEqualToString:NLLanguageEnglish]) {
+        SKRetimeWithParakeet(phrases, path);      // match FCP's words to Parakeet's (no-op without Detect text)
+        SKAddParakeetFillers(phrases, path);
+        if (!SKPreciseTiming())                   // Word timing off: FCP's times (fillers: FCP-equivalent)
+            for (NSArray<SKRawWord *> *pw in phrases) for (SKRawWord *w in pw) { w.s = w.os; w.e = w.oe; w.pk = -1; }
+    } else if (sample.length) TLog(@"%@: transcript language %@, FCP's words and times only", path.lastPathComponent, lang ?: @"unknown");
     [gPhraseCache setObject:phrases forKey:asset];
     return phrases;
 }
@@ -950,26 +994,36 @@ static NSString *SKSpeakerIDForName(NSMutableDictionary *entry, NSString *name) 
     return name;
 }
 
-// FCP's role color palette (the role color picker, 2 columns x 9 rows), averaged from a screenshot.
-// Speakers take these colors; each name keeps its color everywhere (saved in FCP's defaults).
-static const uint32_t kSKRolePalette[18] = {0x1E3452, 0x18532D, 0x1A565B, 0x4F3783, 0x7F4F1D, 0x581D31, 0x415F1A, 0x863E1B, 0x1A5647,
-                                            0x532362, 0x852919, 0x604E19, 0x2B3561, 0x21581B, 0x591F4C, 0x284A5A, 0x585B1A, 0x362E69};
-static const int kSKSpeakerColorOrder[18] = {0, 7, 1, 3, 2, 10, 11, 9, 15, 6, 4, 8, 12, 5, 13, 14, 16, 17};   // distinct hues first
-static NSString *const kSKSpeakerColorsKey = @"SKTranscriptTabSpeakerColors";
-static NSColor *SKRoleColor(NSInteger i) {
-    uint32_t h = kSKRolePalette[MAX(0, MIN(17, i))];
+// v109: speakers have their own muted palette of 8, kept away from FCP's role hues (Dialogue blue,
+// Music green, Effects purple…), which mean something in FCP. Each name keeps its color everywhere
+// (saved in FCP's defaults). The old role-palette indexes (0-17, key SKTranscriptTabSpeakerColors) are
+// remapped once per name; see kSKOldToNewSpeakerColor.
+#define kSKSpeakerColorCount 8
+static const uint32_t kSKSpeakerPalette[kSKSpeakerColorCount] = {0xE8A33D, 0x35B8A0, 0xC57BD0, 0x5AA9F0, 0xF07878, 0xA6C93A, 0x38BFE0, 0xE06FA8};   // amber, teal, orchid, sky, coral, lime, aqua, pink (v115: more saturated; v109's muted set was barely visible)
+static const int kSKOldToNewSpeakerColor[18] = {3, 5, 1, 2, 0, 4, 5, 7, 6, 2, 4, 0, 3, 5, 2, 6, 5, 3};
+static NSString *const kSKSpeakerColorsKey = @"SKTranscriptTabSpeakerColors2";
+static NSString *const kSKOldSpeakerColorsKey = @"SKTranscriptTabSpeakerColors";
+static NSColor *SKSpeakerSwatch(NSInteger i) {
+    uint32_t h = kSKSpeakerPalette[MAX(0, MIN(kSKSpeakerColorCount - 1, i))];
     return [NSColor colorWithSRGBRed:((h >> 16) & 255) / 255.0 green:((h >> 8) & 255) / 255.0 blue:(h & 255) / 255.0 alpha:1];
 }
-// The palette index for a speaker name; a new name gets the first unused color in kSKSpeakerColorOrder.
+// The palette index for a speaker name. A name seen under the role palette keeps its look (nearest new
+// color, or the next free one if another speaker already took it); a new name gets the first unused color.
 static NSInteger SKSpeakerColorIndex(NSString *name) {
     if (!name.length) return -1;
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     NSDictionary *saved = [d dictionaryForKey:kSKSpeakerColorsKey] ?: @{};
     NSNumber *n = saved[name];
-    if ([n isKindOfClass:[NSNumber class]] && n.integerValue >= 0 && n.integerValue < 18) return n.integerValue;
+    if ([n isKindOfClass:[NSNumber class]] && n.integerValue >= 0 && n.integerValue < kSKSpeakerColorCount) return n.integerValue;
     NSSet *used = [NSSet setWithArray:saved.allValues];
-    NSInteger pick = kSKSpeakerColorOrder[saved.count % 18];
-    for (int i = 0; i < 18; i++) if (![used containsObject:@(kSKSpeakerColorOrder[i])]) { pick = kSKSpeakerColorOrder[i]; break; }
+    NSInteger pick = -1;
+    NSNumber *old = [d dictionaryForKey:kSKOldSpeakerColorsKey][name];
+    if ([old isKindOfClass:[NSNumber class]] && old.integerValue >= 0 && old.integerValue < 18) {
+        NSInteger want = kSKOldToNewSpeakerColor[old.integerValue];
+        if (![used containsObject:@(want)]) pick = want;
+    }
+    for (int i = 0; pick < 0 && i < kSKSpeakerColorCount; i++) if (![used containsObject:@(i)]) pick = i;
+    if (pick < 0) pick = saved.count % kSKSpeakerColorCount;
     NSMutableDictionary *m = [saved mutableCopy];
     m[name] = @(pick);
     [d setObject:m forKey:kSKSpeakerColorsKey];
@@ -982,14 +1036,25 @@ static void SKSetSpeakerColorIndex(NSString *name, NSInteger i) {
     if (i < 0) [m removeObjectForKey:name]; else m[name] = @(i);
     [d setObject:m forKey:kSKSpeakerColorsKey];
 }
-// The swatch, brightened in its own hue and lightened so it reads as text (and as a bar) on the dark inspector.
+// The swatch lightened 12% toward white so it reads as text (and as a bar) on the dark inspector.
 static NSColor *SKSpeakerTextColor(NSString *name) {
     NSInteger i = SKSpeakerColorIndex(name);
     if (i < 0) return [NSColor secondaryLabelColor];
-    uint32_t h = kSKRolePalette[i];
-    double c[3] = {(h >> 16) & 255, (h >> 8) & 255, h & 255}, mx = MAX(1, MAX(c[0], MAX(c[1], c[2])));
-    for (int k = 0; k < 3; k++) { c[k] = MIN(255, c[k] * 255 / mx * 0.92); c[k] += (255 - c[k]) * 0.28; }
+    uint32_t h = kSKSpeakerPalette[i];
+    double c[3] = {(h >> 16) & 255, (h >> 8) & 255, h & 255};
+    for (int k = 0; k < 3; k++) c[k] += (255 - c[k]) * 0.12;
     return [NSColor colorWithSRGBRed:c[0] / 255 green:c[1] / 255 blue:c[2] / 255 alpha:1];
+}
+// The small dot shown beside a hovered speaker name: the speaker's own color.
+static NSImage *SKColorDotImage(NSInteger i) {
+    NSColor *c = SKSpeakerSwatch(i);
+    return [NSImage imageWithSize:NSMakeSize(16, 16) flipped:NO drawingHandler:^BOOL(NSRect r) {
+        NSRect dot = NSInsetRect(r, 2, 2);
+        [c setFill]; [[NSBezierPath bezierPathWithOvalInRect:dot] fill];
+        NSBezierPath *ring = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(dot, 0.5, 0.5)];
+        ring.lineWidth = 1; [[NSColor colorWithWhite:1 alpha:0.55] setStroke]; [ring stroke];
+        return YES;
+    }];
 }
 static NSImage *SKSwatchImage(NSColor *c) {
     return [NSImage imageWithSize:NSMakeSize(16, 12) flipped:NO drawingHandler:^BOOL(NSRect r) {
@@ -1015,10 +1080,25 @@ static BOOL SKPreciseTiming(void) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKPreciseTimingKey];
     return v ? [v boolValue] : YES;
 }
-static NSString *const kSKParakeetTextKey = @"SKTranscriptTabParakeetText";   // v82: Parakeet's words (Detect speakers) instead of FCP's
-static BOOL SKParakeetText(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKParakeetTextKey];
-    return v ? [v boolValue] : YES;
+// v82-v103 could show Parakeet's words (View › Words, SKTranscriptTabParakeetText); v104 removed
+// that: the text is always FCP's (FCP 13 transcribes 45 locales), Parakeet only tightens English timing.
+static NSString *const kSKTranscribeLanguageKey = @"SKTranscriptTabTranscribeLanguage";   // v104: "fr-FR", "en-US"…
+// Locales FCP can transcribe (FFTranscriptionCoordinator), as hyphenated identifiers sorted by display name.
+static NSArray<NSArray<NSString *> *> *SKTranscribeLocales(void) {
+    static NSArray *list;
+    if (list) return list;
+    @try {
+        id set = ((id(*)(id,SEL))objc_msgSend)(objc_getClass("FFTranscriptionCoordinator"), NSSelectorFromString(@"qualifiedLocaleIdentifiers"));
+        NSMutableArray *out = [NSMutableArray array];
+        for (NSString *ident in set) {
+            NSString *h = [ident stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+            NSString *name = [[NSLocale currentLocale] localizedStringForLocaleIdentifier:ident] ?: h;
+            [out addObject:@[h, name]];   // names carry the region ("French (Canada)"), so they are unique
+        }
+        [out sortUsingComparator:^NSComparisonResult(NSArray *a, NSArray *b) { return [a[1] localizedCaseInsensitiveCompare:b[1]]; }];
+        if (out.count) list = out;
+    } @catch (id e) { TLog(@"locales threw %@", e); }
+    return list ?: @[@[@"en-US", @"English (United States)"]];
 }
 static BOOL SKColorBars(void) {
     id v = [[NSUserDefaults standardUserDefaults] objectForKey:kSKColorBarsKey];
@@ -1047,7 +1127,7 @@ static NSString *SKStampText(double t, CMTime frame, NSInteger mode) {
     if (!self) return nil;
     self.sectionID = sid; self.owner = owner;
     self.titleLabel = [NSTextField labelWithString:title];
-    self.titleLabel.textColor = [NSColor colorWithWhite:0.69 alpha:1];
+    self.titleLabel.textColor = [NSColor colorWithWhite:0.886 alpha:1];
     self.hideLabel = [NSTextField labelWithString:@"Hide"];
     self.hideLabel.textColor = [NSColor colorWithWhite:0.45 alpha:1];
     self.hideLabel.hidden = YES;
@@ -1063,8 +1143,9 @@ static NSString *SKStampText(double t, CMTime frame, NSInteger mode) {
 - (void)resizeSubviewsWithOldSize:(NSSize)old {
     NSSize t = self.titleLabel.intrinsicContentSize, h = self.hideLabel.intrinsicContentSize;
     CGFloat H = NSHeight(self.bounds), W = NSWidth(self.bounds);
-    self.titleLabel.frame = NSMakeRect(10, floor((H - t.height) / 2), MAX(0, W - 20 - h.width - 8), t.height);
-    self.hideLabel.frame = NSMakeRect(W - 10 - h.width, floor((H - h.height) / 2), h.width, h.height);
+    CGFloat line = self.topLine ? 2 : 0, mid = (H - line) / 2;   // v110: text at x = 26, Hide/Show 29 from the right edge, like FCP's inspector
+    self.titleLabel.frame = NSMakeRect(26, floor(mid - t.height / 2), MAX(0, W - 26 - 29 - h.width - 8), t.height);
+    self.hideLabel.frame = NSMakeRect(W - 29 - h.width, floor(mid - h.height / 2), h.width, h.height);
 }
 - (void)setCollapsed:(BOOL)collapsed {
     _collapsed = collapsed;
@@ -1076,20 +1157,23 @@ static NSString *SKStampText(double t, CMTime frame, NSInteger mode) {
 - (void)mouseExited:(NSEvent *)e { self.hideLabel.hidden = YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)e { return YES; }
 - (void)mouseDown:(NSEvent *)e { [(SKInspectorModuleTranscript *)self.owner sk_toggleSection:self.sectionID]; }
+- (void)setTopLine:(BOOL)topLine { if (_topLine == topLine) return; _topLine = topLine; [self resizeSubviewsWithOldSize:self.bounds.size]; [self setNeedsDisplay:YES]; }
 - (void)drawRect:(NSRect)dirty {
-    [[NSColor colorWithWhite:0.078 alpha:1] setFill];   // hairline between sections (#141414)
-    NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - 1, NSWidth(self.bounds), 1));
+    if (!self.topLine) return;
+    [[NSColor colorWithWhite:0.176 alpha:1] setFill];   // v110: 2 px #2D2D2D above each header, lighter than the ground (FCP's own)
+    NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - 2, NSWidth(self.bounds), 2));
 }
 @end
 
-static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPickerArrow = 10;   // measured from FCP's role color picker
+static const CGFloat kSKSwatch = 28, kSKSwatchH = 28, kSKPickerPad = 2, kSKPickerArrow = 10;   // v109: 4 x 2 swatches (was FCP's 2 x 9 role picker)
+static const int kSKPickerCols = 4, kSKPickerRows = 2;
 
 @implementation SKRoleColorPicker
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstMouse:(NSEvent *)e { return YES; }
-- (NSRect)sk_cell:(NSInteger)i { return NSMakeRect(kSKPickerPad + (i % 2) * kSKSwatch, kSKPickerPad + (i / 2) * kSKSwatchH, kSKSwatch, kSKSwatchH); }
+- (NSRect)sk_cell:(NSInteger)i { return NSMakeRect(kSKPickerPad + (i % kSKPickerCols) * kSKSwatch, kSKPickerPad + (i / kSKPickerCols) * kSKSwatchH, kSKSwatch, kSKSwatchH); }
 - (NSInteger)sk_indexAt:(NSPoint)p {
-    for (NSInteger i = 0; i < 18; i++) if (NSPointInRect(p, [self sk_cell:i])) return i;
+    for (NSInteger i = 0; i < kSKSpeakerColorCount; i++) if (NSPointInRect(p, [self sk_cell:i])) return i;
     return -1;
 }
 - (void)updateTrackingAreas {
@@ -1112,8 +1196,8 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     // Matches FCP's role color picker (measured from a screenshot): the swatches fill the panel,
     // framed by a 1 px #494949 line inside a 1 px near-black outline, and nothing else (v67: a light
     // inner edge read as a thicker frame); the grid has rounded ends; a slate-blue pointer sits on the right edge.
-    NSRect grid = NSMakeRect(kSKPickerPad, kSKPickerPad, kSKSwatch * 2, kSKSwatchH * 9);
-    CGFloat rad = 13;
+    NSRect grid = NSMakeRect(kSKPickerPad, kSKPickerPad, kSKSwatch * kSKPickerCols, kSKSwatchH * kSKPickerRows);
+    CGFloat rad = 10;
     [[NSColor colorWithSRGBRed:0.04 green:0.03 blue:0.07 alpha:1] setFill];
     [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(grid, -2, -2) xRadius:rad + 2 yRadius:rad + 2] fill];
     [[NSColor colorWithWhite:0.286 alpha:1] setFill];   // #494949
@@ -1121,9 +1205,9 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     [NSGraphicsContext saveGraphicsState];
     NSBezierPath *clip = [NSBezierPath bezierPathWithRoundedRect:grid xRadius:rad yRadius:rad];
     [clip addClip];
-    for (NSInteger i = 0; i < 18; i++) { [SKRoleColor(i) setFill]; NSRectFill([self sk_cell:i]); }
+    for (NSInteger i = 0; i < kSKSpeakerColorCount; i++) { [SKSpeakerSwatch(i) setFill]; NSRectFill([self sk_cell:i]); }
     [NSGraphicsContext restoreGraphicsState];
-    if (self.selected >= 0 && self.selected < 18) {
+    if (self.selected >= 0 && self.selected < kSKSpeakerColorCount) {
         NSBezierPath *sel = [NSBezierPath bezierPathWithRect:NSInsetRect([self sk_cell:self.selected], 1.5, 1.5)];
         sel.lineWidth = 2; [[NSColor whiteColor] setStroke]; [sel stroke];
     }
@@ -1157,17 +1241,31 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     [self.fill setFill];
     NSRectFill(dirty);
     if (self.rowHeight > 0) {
-        [[NSColor colorWithWhite:0.15 alpha:1] setFill];   // #262626 between parameter rows
-        for (CGFloat y = self.rowHeight; y < NSHeight(self.bounds) - 1; y += self.rowHeight) NSRectFill(NSMakeRect(0, round(y), NSWidth(self.bounds), 1));
+        [[NSColor colorWithWhite:0.122 alpha:1] setFill];   // v110: 1 px of the ground (#1F1F1F) between and under parameter rows, as in FCP
+        for (CGFloat y = 0; y < NSHeight(self.bounds); y += self.rowHeight) NSRectFill(NSMakeRect(0, round(y), NSWidth(self.bounds), 1));
     }
     if (self.topLine) {
-        [[NSColor colorWithWhite:0.078 alpha:1] setFill];
-        NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - 1, NSWidth(self.bounds), 1));
+        [(self.lineColor ?: [NSColor colorWithWhite:0.078 alpha:1]) setFill];
+        CGFloat lh = self.lineHeight > 0 ? self.lineHeight : 1;
+        NSRectFill(NSMakeRect(0, NSHeight(self.bounds) - lh, NSWidth(self.bounds), lh));
     }
 }
 @end
 
 #pragma mark - Text view
+
+@implementation SKFooterHost
+- (BOOL)sk_shouldShow {
+    id m = self.module;
+    return m && [m sk_isShowing] && [[m valueForKey:@"emptyKind"] integerValue] == 0;
+}
+- (void)viewWillDraw {
+    BOOL show = [self sk_shouldShow];
+    for (NSView *v in self.subviews) if (v.hidden == show) v.hidden = !show;
+    [super viewWillDraw];
+}
+- (NSView *)hitTest:(NSPoint)p { return [self sk_shouldShow] ? [super hitTest:p] : nil; }
+@end
 
 @implementation SKTranscriptTextView
 - (void)drawViewBackgroundInRect:(NSRect)rect {
@@ -1338,22 +1436,36 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     [self.timecodePopup selectItemWithTag:SKTimecodeMode()];
     self.timecodePopup.target = self; self.timecodePopup.action = @selector(sk_timecodeChanged:);
     self.timecodePopup.toolTip = @"How each line's time is shown";
-    self.barsCheckbox = [NSButton checkboxWithTitle:@"Mark each speaker's lines" target:self action:@selector(sk_barsChanged:)];
+    self.barsCheckbox = [NSButton checkboxWithTitle:@"" target:self action:@selector(sk_barsChanged:)];
     self.barsCheckbox.controlSize = NSControlSizeSmall;
     self.barsCheckbox.state = SKColorBars() ? NSControlStateValueOn : NSControlStateValueOff;
     self.barsCheckbox.toolTip = @"A bar in the speaker's color beside their lines";
-    self.darkCheckbox = [NSButton checkboxWithTitle:@"Dark" target:self action:@selector(sk_darkChanged:)];
+    self.darkCheckbox = [NSButton checkboxWithTitle:@"" target:self action:@selector(sk_darkChanged:)];
     self.darkCheckbox.controlSize = NSControlSizeSmall;
     self.darkCheckbox.state = [[NSUserDefaults standardUserDefaults] boolForKey:kSKDarkBackgroundKey] ? NSControlStateValueOn : NSControlStateValueOff;
     self.darkCheckbox.toolTip = @"Darker transcript background (otherwise the same gray as these rows)";
-    self.timingCheckbox = [NSButton checkboxWithTitle:@"Precise (from Detect)" target:self action:@selector(sk_timingChanged:)];
+    self.timingCheckbox = [NSButton checkboxWithTitle:@"" target:self action:@selector(sk_timingChanged:)];
     self.timingCheckbox.controlSize = NSControlSizeSmall;
     self.timingCheckbox.state = SKPreciseTiming() ? NSControlStateValueOn : NSControlStateValueOff;
-    self.timingCheckbox.toolTip = @"Use the word timings from Speakers › Detect (Parakeet) instead of Final Cut Pro's, which are often a few tenths of a second early. Files detected before this option existed need Re-detect once.";
-    self.wordsCheckbox = [NSButton checkboxWithTitle:@"Parakeet (from Detect)" target:self action:@selector(sk_timingChanged:)];
-    self.wordsCheckbox.controlSize = NSControlSizeSmall;
-    self.wordsCheckbox.state = SKParakeetText() ? NSControlStateValueOn : NSControlStateValueOff;
-    self.wordsCheckbox.toolTip = @"Show the words Speakers › Detect (Parakeet) heard instead of Final Cut Pro's transcript: usually more accurate on names and terms, and keeps um/uh and repeats. Your corrections carry over. Files without Detect keep Final Cut Pro's words.";
+    self.timingCheckbox.toolTip = @"Use the word timings from Speakers › Detect (Parakeet) instead of Final Cut Pro's, which are often a few tenths of a second early. English transcripts only; the words themselves are always Final Cut Pro's. Files detected before this option existed need Re-detect once.";
+    self.languagePopup = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0, 0, 200, 22) pullsDown:NO];
+    self.languagePopup.controlSize = NSControlSizeSmall;
+    self.languagePopup.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+    self.languagePopup.target = self; self.languagePopup.action = @selector(sk_languageChanged:);
+    [self.languagePopup setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    self.languagePopup.toolTip = @"Language Transcribe uses (Final Cut Pro 13's list). Clips already transcribed keep the language they were transcribed in.";
+    {
+        NSString *saved = [[NSUserDefaults standardUserDefaults] stringForKey:kSKTranscribeLanguageKey];
+        if (!saved) {   // FCP's own default for Analyze and Fix
+            NSString *d = [[NSUserDefaults standardUserDefaults] stringForKey:@"FFAnalyzeAndFixTranscriptionLanguage"];
+            saved = d.length ? [d stringByReplacingOccurrencesOfString:@"_" withString:@"-"] : @"en-US";
+        }
+        for (NSArray *l in SKTranscribeLocales()) {
+            [self.languagePopup addItemWithTitle:l[1]];
+            self.languagePopup.lastItem.representedObject = l[0];
+            if ([l[0] isEqualToString:saved]) [self.languagePopup selectItem:self.languagePopup.lastItem];
+        }
+    }
 
     // FCP inspector layout (v63): sections with a header band, labelled rows on the lighter gray,
     // the transcript below, and Export / Create Captions in a footer bar.
@@ -1361,7 +1473,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     NSArray *(^makeRow)(NSString *, NSArray *) = ^NSArray *(NSString *label, NSArray *views) {
         NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 400, 26)];
         NSTextField *l = [NSTextField labelWithString:label];
-        l.alignment = NSTextAlignmentRight;
+        l.alignment = NSTextAlignmentLeft;   // v110: labels on the left at x = 26
         l.textColor = [NSColor colorWithWhite:0.71 alpha:1];
         NSStackView *st = [NSStackView stackViewWithViews:views];
         st.orientation = NSUserInterfaceLayoutOrientationHorizontal; st.spacing = 6;
@@ -1385,25 +1497,36 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
         }
         [sections addObject:sec];
     };
-    addSection(@"cleanup", @"Cleanup", @[makeRow(@"Fillers", @[self.fillerButton]), makeRow(@"Pauses", @[self.pauseButton, threshold])]);
-    addSection(@"speakers", @"Speakers", @[makeRow(@"Show", @[self.speakerPopup, self.detectButton])]);
+    // v110: one control per row, labels left, values right (FCP's inspector).
+    addSection(@"cleanup", @"Cleanup", @[makeRow(@"Fillers", @[self.fillerButton]), makeRow(@"Pauses", @[self.pauseButton]),
+                                         makeRow(@"Pauses longer than", @[threshold])]);
+    addSection(@"speakers", @"Speakers", @[makeRow(@"Show", @[self.speakerPopup]), makeRow(@"Detection", @[self.detectButton])]);
     addSection(@"view", @"View", @[makeRow(@"Timecode", @[self.timecodePopup]), makeRow(@"Text size", @[[self sk_makeSizeControl]]),
-                                   makeRow(@"Color bars", @[self.barsCheckbox]), makeRow(@"Background", @[self.darkCheckbox]),
-                                   makeRow(@"Words", @[self.wordsCheckbox]), makeRow(@"Word timing", @[self.timingCheckbox])]);
+                                   makeRow(@"Color bars", @[self.barsCheckbox]), makeRow(@"Dark background", @[self.darkCheckbox]),
+                                   makeRow(@"Precise word timing", @[self.timingCheckbox])]);
     addSection(@"find", @"Find & Replace", @[makeRow(@"Find", @[self.searchField, self.findCount, self.prevButton, self.nextButton]),
                                              makeRow(@"Replace", @[self.replaceField, self.replaceButton, self.replaceAllButton])]);
-    addSection(@"transcript", @"Transcript", @[]);
+    addSection(@"transcript", @"Transcript", @[makeRow(@"Language", @[self.languagePopup])]);
     self.sections = sections;
     SKFillView *footer = [[SKFillView alloc] initWithFrame:NSMakeRect(0, 0, 400, 30)];
     footer.fill = [NSColor colorWithWhite:0.122 alpha:1]; footer.topLine = YES;
+    footer.lineColor = [NSColor colorWithWhite:0.176 alpha:1]; footer.lineHeight = 2;   // v110: the same 2 px separator as the sections
     footer.autoresizingMask = NSViewWidthSizable | NSViewMaxYMargin;
     NSStackView *fst = [[NSStackView alloc] initWithFrame:footer.bounds];
     fst.orientation = NSUserInterfaceLayoutOrientationHorizontal; fst.spacing = 6;
     fst.translatesAutoresizingMaskIntoConstraints = YES;
     fst.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    self.helpButton =[NSButton buttonWithTitle:@"" target:self action:@selector(sk_openManual:)];
+    self.helpButton.bezelStyle = NSBezelStyleHelpButton; self.helpButton.controlSize = NSControlSizeSmall;
+    self.helpButton.title = @""; self.helpButton.contentTintColor = [NSColor labelColor];   // v116: the standard gray help button (the ? had taken the accent color)
+    self.helpButton.toolTip = @"Open the Transcript Tab manual in your browser";
+    [fst addView:self.helpButton inGravity:NSStackViewGravityLeading];   // v117: help at the bottom-left (HIG), then Export
     [fst addView:self.exportPopup inGravity:NSStackViewGravityLeading];
-    [fst addView:self.captionsButton inGravity:NSStackViewGravityTrailing];
-    [footer addSubview:fst];
+    SKFooterHost *host = [[SKFooterHost alloc] initWithFrame:NSMakeRect(0, 0, 400, 28)];
+    host.module = self; host.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [host addSubview:fst];
+    self.footerHost = host;
+    footer.hidden = YES;   // v124: the old bar of ours stays unused
     [container addSubview:footer];
     self.footer = footer; self.footerStack = fst;
     NSScrollView *sv = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 30, 400, 400)];
@@ -1412,18 +1535,39 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     sv.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     SKTranscriptTextView *tv = [[SKTranscriptTextView alloc] initWithFrame:sv.bounds];
     tv.module = self;
+    // v118: selection in FCP's lighter slate-blue, the same whether or not the panel has focus
+    tv.selectedTextAttributes = @{NSBackgroundColorAttributeName: [NSColor clearColor],   // drawn by SKTranscriptTextView (v119)
+                                  NSForegroundColorAttributeName: [NSColor whiteColor]};
+    { SKSelectionLayoutManager *slm = [SKSelectionLayoutManager new]; slm.selView = tv; [tv.textContainer replaceLayoutManager:slm]; }
     tv.editable = NO; tv.drawsBackground = NO;
-    tv.textContainerInset = NSMakeSize(10, 8);
+    tv.textContainerInset = NSMakeSize(26, 8);   // v110: timecodes start at x = 26, like the labels
     tv.autoresizingMask = NSViewWidthSizable;
     sv.documentView = tv;
     self.transcribeButton = barButton(@selector(sk_transcribeClicked:));
     self.transcribeButton.title = @"Transcribe";
     self.transcribeButton.bezelStyle = NSBezelStyleRounded;
-    self.transcribeButton.toolTip = @"Transcribe with Final Cut Pro (same as Modify › Analyze and Fix › Transcribe); the transcript is saved in the library";
+    self.transcribeButton.controlSize = NSControlSizeRegular;
+    self.transcribeButton.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
+    self.transcribeButton.bezelColor = [NSColor controlAccentColor];
+    self.transcribeButton.toolTip = @"Transcribe with Final Cut Pro's built-in transcription (same as Modify › Analyze and Fix › Transcribe); the transcript is saved in the library";
     self.transcribeButton.hidden = YES;
-    [tv addSubview:self.transcribeButton];
-    NSImage *wheel = [([[NSBundle bundleWithIdentifier:@"com.apple.Flexo"] imageForResource:@"F_RoleEditor_Color"] ?: [NSImage imageNamed:NSImageNameColorPanel]) copy];   // a copy: resizing the shared image would shrink FCP's own
-    wheel.size = NSMakeSize(16, 16);
+    // v110: the no-transcript / transcribing / failed view, over the transcript area.
+    NSView *ev = [[NSView alloc] initWithFrame:NSMakeRect(0, 30, 400, 400)];
+    ev.hidden = YES;
+    self.emptyIcon = [NSImageView imageViewWithImage:[NSImage new]];
+    self.emptyIcon.imageScaling = NSImageScaleProportionallyUpOrDown;
+    self.emptySpinner = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(0, 0, 32, 32)];
+    self.emptySpinner.style = NSProgressIndicatorStyleSpinning; self.emptySpinner.indeterminate = YES; self.emptySpinner.hidden = YES;
+    self.emptyTitleLabel = [NSTextField labelWithString:@""];
+    self.emptyTitleLabel.font = [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold];
+    self.emptyTitleLabel.textColor = [NSColor colorWithWhite:0.93 alpha:1]; self.emptyTitleLabel.alignment = NSTextAlignmentCenter;
+    self.emptyBodyLabel = [NSTextField wrappingLabelWithString:@""];
+    self.emptyBodyLabel.font = [NSFont systemFontOfSize:12];
+    self.emptyBodyLabel.textColor = [NSColor colorWithWhite:0.62 alpha:1]; self.emptyBodyLabel.alignment = NSTextAlignmentCenter;
+    self.emptyBodyLabel.selectable = NO;
+    for (NSView *v in @[self.emptyIcon, self.emptySpinner, self.emptyTitleLabel, self.emptyBodyLabel, self.transcribeButton]) [ev addSubview:v];
+    self.emptyView = ev;
+    NSImage *wheel = SKColorDotImage(0);   // v109: a dot in the speaker's own color (was FCP's role color circle); recolored on hover
     self.colorWheelButton = [NSButton buttonWithImage:wheel target:self action:@selector(sk_colorWheelClicked:)];
     self.colorWheelButton.bordered = NO;
     self.colorWheelButton.imageScaling = NSImageScaleProportionallyDown;
@@ -1432,7 +1576,12 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.colorWheelButton.toolTip = @"Change this speaker's color";
     [tv addSubview:self.colorWheelButton];
     [container addSubview:sv];
+    [container addSubview:ev];
     self.textView = tv; self.scroll = sv; self.container = container;
+    // v110: rows and right-aligned controls are placed by hand, so lay them out again whenever the inspector is resized.
+    container.postsFrameChangedNotifications = YES;
+    __weak SKInspectorModuleTranscript *wl = self;
+    [[NSNotificationCenter defaultCenter] addObserverForName:NSViewFrameDidChangeNotification object:container queue:nil usingBlock:^(NSNotification *n) { [wl sk_layoutSections]; }];
     [self sk_applyControlScale];
     [self setView:container];
     __weak SKInspectorModuleTranscript *weakSelf = self;
@@ -1625,7 +1774,7 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     NSFont *font = [NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:NSControlSizeSmall]];
     for (NSControl *c in @[self.fillerButton, self.pauseButton, self.thresholdPopup, self.speakerPopup, self.detectButton,
                            self.exportPopup, self.captionsButton, self.searchField, self.prevButton, self.nextButton,
-                           self.replaceField, self.replaceButton, self.replaceAllButton, self.transcribeButton]) {
+                           self.replaceField, self.replaceButton, self.replaceAllButton]) {
         c.controlSize = size; c.font = font;
     }
     self.findCount.font = font;
@@ -1634,8 +1783,11 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.barsCheckbox.controlSize = size; self.barsCheckbox.font = font;
     self.darkCheckbox.controlSize = size; self.darkCheckbox.font = font;
     self.timingCheckbox.controlSize = size; self.timingCheckbox.font = font;
-    self.wordsCheckbox.controlSize = size; self.wordsCheckbox.font = font;
-    NSFont *bold = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold], *plain = [NSFont systemFontOfSize:11];
+    self.languagePopup.controlSize = size; self.languagePopup.font = font;
+    // v110: pop-ups are borderless text with a chevron (12 pt) like FCP's; raised buttons stay for actions.
+    NSFont *popFont = [NSFont systemFontOfSize:12];
+    for (NSPopUpButton *pop in @[self.thresholdPopup, self.speakerPopup, self.timecodePopup, self.languagePopup, self.exportPopup]) { pop.bordered = NO; pop.font = popFont; if (pop != self.exportPopup) pop.alignment = NSTextAlignmentRight; }
+    NSFont *bold = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium], *plain = [NSFont systemFontOfSize:12];
     for (NSDictionary *sec in self.sections) {
         [(SKSectionHeaderView *)sec[@"header"] setFont:bold plain:plain];
         for (NSArray *r in sec[@"rows"]) ((NSTextField *)r[1]).font = plain;
@@ -1645,40 +1797,118 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
 
 // Stack the sections from the top: header, then its rows unless folded. The transcript fills the
 // space down to the footer. Folded sections are remembered in FCP's defaults.
+// v110 geometry (measured from FCP's inspector): 25 px header band under a 2 px #2D2D2D line, 24 px rows
+// with a 1 px ground divider, labels at x = 26, values right-aligned 29 px from the edge, 32 px footer.
+// With no transcript (emptyKind != 0) only the Transcript header, its Language row and the empty view show.
 - (void)sk_layoutSections {
-    const double sc = 1.0;   // fixed: Text size scales only the transcript
     CGFloat W = NSWidth(self.container.bounds), H = NSHeight(self.container.bounds);
-    CGFloat hh = round(22 * sc), rh = round(26 * sc), fh = round(30 * sc), labelW = round(78 * sc), y = H;
+    const CGFloat hh = 25, hline = 2, rh = 24, rp = 25, fh = 32, padL = 26, padR = 29, labelW = 120;
+    BOOL empty = self.emptyKind != 0;
+    CGFloat y = H;
+    BOOL first = YES;
     NSArray *collapsed = SKCollapsedSections();
     for (NSDictionary *sec in self.sections) {
-        BOOL closed = [collapsed containsObject:sec[@"id"]];
+        BOOL isTranscript = [sec[@"id"] isEqualToString:@"transcript"];
         SKSectionHeaderView *h = sec[@"header"];
-        h.frame = NSMakeRect(0, y - hh, W, hh); y -= hh;
-        h.collapsed = closed;
         SKFillView *box = sec[@"box"];
+        if (empty && !isTranscript) { h.hidden = YES; box.hidden = YES; continue; }
+        h.hidden = NO;
+        BOOL closed = [collapsed containsObject:sec[@"id"]];
+        h.topLine = !first;
+        CGFloat hH = hh + (first ? 0 : hline);
+        first = NO;
+        h.frame = NSMakeRect(0, y - hH, W, hH); y -= hH;
+        h.collapsed = closed;
         if (box) {
             NSArray *rows = sec[@"rows"];
-            box.hidden = closed;
-            if (closed) continue;
-            CGFloat bh = rh * rows.count;
-            box.frame = NSMakeRect(0, y - bh, W, bh); box.rowHeight = rh; y -= bh;
-            for (NSUInteger i = 0; i < rows.count; i++) {
-                NSArray *r = rows[i];
-                ((NSView *)r[0]).frame = NSMakeRect(0, bh - rh * (i + 1), W, rh);
-                NSTextField *l = r[1];
-                CGFloat lh = ceil(l.intrinsicContentSize.height);
-                l.frame = NSMakeRect(4, floor((rh - lh) / 2), labelW, lh);
-                ((NSView *)r[2]).frame = NSMakeRect(labelW + 12, 0, MAX(0, W - labelW - 22), rh);
+            BOOL showRows = !closed && (!isTranscript || empty);   // Language only matters before Transcribe
+            box.hidden = !showRows;
+            if (showRows) {
+                CGFloat bh = rp * rows.count;
+                box.frame = NSMakeRect(0, y - bh, W, bh); box.rowHeight = rp; y -= bh;
+                for (NSUInteger i = 0; i < rows.count; i++) {
+                    NSArray *r = rows[i];
+                    ((NSView *)r[0]).frame = NSMakeRect(0, bh - rp * (i + 1) + 1, W, rh);
+                    NSTextField *l = r[1];
+                    CGFloat lh = ceil(l.intrinsicContentSize.height);
+                    l.frame = NSMakeRect(padL, floor((rh - lh) / 2), labelW, lh);
+                    NSStackView *st = r[2];
+                    BOOL stretch = [st.arrangedSubviews containsObject:self.searchField] || [st.arrangedSubviews containsObject:self.replaceField];
+                    if (stretch) st.frame = NSMakeRect(padL + labelW, 0, MAX(0, W - padL - labelW - padR), rh);
+                    else {
+                        CGFloat fw = st.spacing * MAX(0, (NSInteger)st.arrangedSubviews.count - 1);
+                        for (NSView *v in st.arrangedSubviews) {
+                            CGFloat cw = [v isKindOfClass:[NSControl class]] && ((NSControl *)v).cell ? [((NSControl *)v).cell cellSize].width : 0;
+                            fw += MAX(cw, MAX(v.fittingSize.width, v.intrinsicContentSize.width > 0 ? v.intrinsicContentSize.width : 0));
+                        }
+                        st.frame = NSMakeRect(W - padR - fw, 0, fw, rh);
+                        [st layoutSubtreeIfNeeded];   // the stack packs its views to the left: shift so the last one ends at the right edge
+                        CGFloat gap = fw - NSMaxX(st.arrangedSubviews.lastObject.frame);
+                        if (gap > 0.5) st.frame = NSMakeRect(W - padR - fw + gap, 0, fw, rh);
+                    }
+                }
+                [box setNeedsDisplay:YES];
             }
-            [box setNeedsDisplay:YES];
-        } else {   // the transcript
-            self.scroll.hidden = closed;
-            self.scroll.frame = NSMakeRect(0, fh, W, MAX(0, y - fh));
-            y = fh;
+        }
+        if (isTranscript) {   // the transcript text (or the empty view), below its rows
+            CGFloat fb = 0;   // v124: no footer of ours (help + Export sit in FCP's footer bar)
+            NSRect area = NSMakeRect(0, fb, W, MAX(0, y - fb));
+            self.scroll.hidden = closed || empty;
+            self.scroll.frame = area;
+            self.emptyView.frame = area;
+            self.emptyView.hidden = !empty || closed;
+            y = fb;
         }
     }
+    self.footer.hidden = YES;
     self.footer.frame = NSMakeRect(0, 0, W, fh);
-    self.footerStack.frame = NSMakeRect(10, 0, MAX(0, W - 20), fh - 1);
+
+    [self sk_layoutEmpty];
+}
+// Centers the icon / spinner, title, sentence and button in the empty view.
+- (void)sk_layoutEmpty {
+    NSView *ev = self.emptyView;
+    if (!ev || ev.hidden) return;
+    CGFloat W = NSWidth(ev.bounds), H = NSHeight(ev.bounds), bodyW = MIN(400, MAX(120, W - 48));
+    NSSize ts = self.emptyTitleLabel.intrinsicContentSize;
+    self.emptyBodyLabel.preferredMaxLayoutWidth = bodyW;
+    NSRect br = [self.emptyBodyLabel.attributedStringValue boundingRectWithSize:NSMakeSize(bodyW, 1000) options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading];
+    CGFloat iconH = self.emptySpinner.hidden ? 52 : 32, bodyH = ceil(br.size.height) + 2;
+    BOOL btn = !self.transcribeButton.hidden;
+    [self.transcribeButton sizeToFit];
+    CGFloat btnH = btn ? MAX(24, NSHeight(self.transcribeButton.frame)) : 0, btnW = btn ? MAX(110, NSWidth(self.transcribeButton.frame) + 20) : 0;
+    CGFloat total = iconH + 8 + ceil(ts.height) + 8 + bodyH + (btn ? 12 + btnH : 0);
+    CGFloat top = MAX(8, (H - total) / 2 + total * 0.08);   // a little above center
+    CGFloat yy = H - top;   // views are not flipped: work down from the top
+    NSView *iconView = self.emptySpinner.hidden ? (NSView *)self.emptyIcon : (NSView *)self.emptySpinner;
+    CGFloat iw = self.emptySpinner.hidden ? 56 : 32;
+    iconView.frame = NSMakeRect(round((W - iw) / 2), yy - iconH, iw, iconH); yy -= iconH + 8;
+    self.emptyTitleLabel.frame = NSMakeRect(0, yy - ceil(ts.height), W, ceil(ts.height)); yy -= ceil(ts.height) + 8;
+    self.emptyBodyLabel.frame = NSMakeRect(round((W - bodyW) / 2), yy - bodyH, bodyW, bodyH); yy -= bodyH + 12;
+    if (btn) self.transcribeButton.frame = NSMakeRect(round((W - btnW) / 2), yy - btnH, btnW, btnH);
+}
+// Sets the empty view's state: 0 hides it; 1 no transcript, 2 transcribing, 3 failed.
+- (void)sk_setEmptyKind:(NSInteger)kind title:(NSString *)title body:(NSString *)body {
+    BOOL changed = kind != self.emptyKind;
+    self.emptyKind = kind;
+    if (kind) {
+        self.emptyTitleLabel.stringValue = title ?: @"";
+        self.emptyBodyLabel.stringValue = body ?: @"";
+        NSString *sym = kind == 3 ? @"exclamationmark.triangle" : @"text.quote";
+        NSImage *img = [NSImage imageWithSystemSymbolName:sym accessibilityDescription:nil];
+        NSColor *iconColor = kind == 3 ? [NSColor colorWithSRGBRed:0.88 green:0.57 blue:0.25 alpha:1] : [NSColor colorWithWhite:0.55 alpha:1];
+        NSImageSymbolConfiguration *cfg = [[NSImageSymbolConfiguration configurationWithPointSize:44 weight:NSFontWeightLight] configurationByApplyingConfiguration:[NSImageSymbolConfiguration configurationWithPaletteColors:@[iconColor, iconColor]]];
+        self.emptyIcon.image = [img imageWithSymbolConfiguration:cfg];
+        self.emptyIcon.hidden = kind == 2;
+        self.emptySpinner.hidden = kind != 2;
+        if (kind == 2) [self.emptySpinner startAnimation:nil]; else [self.emptySpinner stopAnimation:nil];
+        self.transcribeButton.hidden = kind == 2;
+        if (kind != 2) self.transcribeButton.title = gTranscribeLabel ?: (kind == 3 ? @"Try Again" : @"Transcribe");
+    } else {
+        [self.emptySpinner stopAnimation:nil];
+        self.transcribeButton.hidden = YES;
+    }
+    if (changed) [self sk_layoutSections]; else [self sk_layoutEmpty];
 }
 - (void)sk_toggleSection:(NSString *)sid {
     NSMutableArray *c = [SKCollapsedSections() mutableCopy];
@@ -1697,9 +1927,14 @@ static const CGFloat kSKSwatch = 30, kSKSwatchH = 31, kSKPickerPad = 2, kSKPicke
     self.scroll.backgroundColor = SKTranscriptBackground();
     TLog(@"transcript background -> %@", sender.state == NSControlStateValueOn ? @"dark" : @"gray");
 }
+- (void)sk_languageChanged:(NSPopUpButton *)sender {
+    NSString *l = sender.selectedItem.representedObject;
+    if (l) [[NSUserDefaults standardUserDefaults] setObject:l forKey:kSKTranscribeLanguageKey];
+    TLog(@"transcribe language -> %@", l);
+}
 - (void)sk_timingChanged:(NSButton *)sender {
-    [[NSUserDefaults standardUserDefaults] setBool:sender.state == NSControlStateValueOn forKey:sender == self.wordsCheckbox ? kSKParakeetTextKey : kSKPreciseTimingKey];
-    TLog(@"%@ -> %d", sender == self.wordsCheckbox ? @"parakeet text" : @"precise timing", sender.state == NSControlStateValueOn);
+    [[NSUserDefaults standardUserDefaults] setBool:sender.state == NSControlStateValueOn forKey:kSKPreciseTimingKey];
+    TLog(@"precise timing -> %d", sender.state == NSControlStateValueOn);
     SKClearAssetCaches();
     [self sk_refresh];
 }
@@ -1798,7 +2033,7 @@ static BOOL SKIsFiller(NSString *text) {
     for (id it in items) if (![primary containsObject:it]) { seq = NO; break; }
     NSMutableString *k = [NSMutableString string];
     if (seq) [k appendString:@"SEQ"]; else for (id it in items) [k appendFormat:@"%p,", it];
-    [k appendFormat:@"|%@|%@|%.3f|%ld|%d|%g|%.0f|%d", sig, gSpeakerFilter ?: @"", gPauseThreshold, (long)SKTimecodeMode(), SKColorBars(), SKTextScale(), gPhraseCacheBorn, SKPreciseTiming() + 2 * SKParakeetText()];
+    [k appendFormat:@"|%@|%@|%.3f|%ld|%d|%g|%.0f|%d", sig, gSpeakerFilter ?: @"", gPauseThreshold, (long)SKTimecodeMode(), SKColorBars(), SKTextScale(), gPhraseCacheBorn, SKPreciseTiming()];
     return k;
 }
 - (void)sk_requestRefresh {
@@ -1827,7 +2062,7 @@ static BOOL SKIsFiller(NSString *text) {
     NSArray *items = gItems;
     NSDictionary *body = @{NSFontAttributeName: [NSFont systemFontOfSize:SKPt(13)], NSForegroundColorAttributeName: [NSColor labelColor]};
     NSDictionary *dim = @{NSFontAttributeName: [NSFont systemFontOfSize:SKPt(11)], NSForegroundColorAttributeName: [NSColor secondaryLabelColor]};
-    NSFont *stampFont = [NSFont monospacedDigitSystemFontOfSize:SKPt(10) weight:NSFontWeightRegular];
+    NSFont *stampFont = [NSFont monospacedDigitSystemFontOfSize:SKPt(11) weight:NSFontWeightRegular];   // v110: 11 pt timecodes
     NSDictionary *stamp = @{NSFontAttributeName: stampFont, NSForegroundColorAttributeName: [NSColor tertiaryLabelColor]};
     NSDictionary *pauseAttrs = @{NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:SKPt(10) weight:NSFontWeightRegular], NSForegroundColorAttributeName: [NSColor secondaryLabelColor], NSCursorAttributeName: [NSCursor pointingHandCursor]};
     // Layout (v63): "\t<time>\t<words>" — the time right-aligned in its own column, the words (and
@@ -1838,6 +2073,7 @@ static BOOL SKIsFiller(NSString *text) {
     CGFloat tcW = tcMode == 3 ? 0 : ceil([sample sizeWithAttributes:@{NSFontAttributeName: stampFont}].width);
     CGFloat textX = tcW + (tcW > 0 ? SKPt(8) : 0) + (bars ? SKPt(10) : 0);
     self.barX = textX - SKPt(10);
+    if ([self.textView.layoutManager isKindOfClass:[SKSelectionLayoutManager class]]) ((SKSelectionLayoutManager *)self.textView.layoutManager).textLeft = textX;
     NSMutableParagraphStyle *linePS = [NSMutableParagraphStyle new];
     linePS.headIndent = textX;
     linePS.firstLineHeadIndent = tcW > 0 ? 0 : textX;
@@ -1885,6 +2121,7 @@ static BOOL SKIsFiller(NSString *text) {
     NSUInteger fillerCount = 0, pauseCount = 0;
 
     gRetryRange = NSMakeRange(NSNotFound, 0);
+    NSInteger emptyKindNew = 0; NSString *emptyTitleNew = nil, *emptyBodyNew = nil;   // v110
     NSString *timelineName = nil;
     @try {
         NSArray *primary = SKPrimaryItems();
@@ -1926,7 +2163,7 @@ static BOOL SKIsFiller(NSString *text) {
             BOOL isConn = [entry[@"conn"] boolValue];
             BOOL placed = sequenceMode && entry[@"tl"] != nil;
             double tlStart = [entry[@"tl"] doubleValue], trimStart0 = [entry[@"trim"] doubleValue], clipDur = [entry[@"dur"] doubleValue];
-            double rate = [entry[@"rate"] doubleValue]; if (rate <= 0) rate = 1;   // source seconds per timeline second
+            double rate = [entry[@"rate"] doubleValue]; if (rate <= 0) rate = 1;   // v103: source seconds per timeline second
             double srcDur = clipDur * rate;
             CMTimeRange clipRange = kCMTimeRangeZero;
             CMTime clipFrame = CMTimeMake(1, 600);
@@ -1940,7 +2177,7 @@ static BOOL SKIsFiller(NSString *text) {
             if (placed && !isConn) timelineEnd = MAX(timelineEnd, tlStart + clipDur);
             NSArray *assets = SKAssetsForItem(clip);
             if (assets.count == 0) continue;   // gaps, generators: their time shows up as a pause
-            // multi-asset (synced) clips: show one asset's text (audio-only ones first) and don't
+            // v102: multi-asset (synced) clips: show one asset's text (audio-only ones first) and don't
             // prompt for transcripts of the others when one has words.
             BOOL multi = assets.count > 1;
             NSArray *useAssets = assets;
@@ -1971,6 +2208,10 @@ static BOOL SKIsFiller(NSString *text) {
                 }
                 NSDictionary *entry = SKSpeakerEntry(path, NO);
                 NSDictionary *corrections = [entry[@"corrections"] isKindOfClass:[NSDictionary class]] ? entry[@"corrections"] : nil;
+                // v106: a word cut down to less than one project frame at a clip edge isn't shown: a
+                // delete must stop on a frame line, so it could never be removed (a 0.03 s "uh" sliver
+                // before "severe" stayed listed after Delete fillers). In media seconds.
+                double minKeep = placed ? CMTimeGetSeconds(SKFrameDuration()) * rate : 0;
                 for (NSArray<SKRawWord *> *pw in rawPhrases) {
                     BOOL opened = NO;
                     for (SKRawWord *rw in pw) {
@@ -1985,14 +2226,15 @@ static BOOL SKIsFiller(NSString *text) {
                             double cs = [crow[4] doubleValue], ce = [crow[5] doubleValue];
                             double ck = MIN(ce, trimStart + srcDur) - MAX(cs, trimStart);
                             if (ck < MIN(0.10, 0.6 * (ce - cs)) - 1e-4) continue;   // trimmed away
+                            if ((cs < trimStart || ce > trimStart + srcDur) && ck < minKeep - 1e-4) continue;   // sub-frame sliver at a cut
                         } else if (placed) { double kept = MIN(e, trimStart + srcDur) - MAX(s, trimStart);
-                            if (kept < MIN(0.06, (e - s) / 2) - 1e-4 || (e - s < 1e-4 && (s < trimStart - 0.001 || s >= trimStart + srcDur - 0.001))) continue; }   // trimmed away
+                            if (kept < MIN(0.06, (e - s) / 2) - 1e-4 || (e - s < 1e-4 && (s < trimStart - 0.001 || s >= trimStart + srcDur - 0.001))) continue;   // trimmed away
+                            if ((s < trimStart || e > trimStart + srcDur) && kept < minKeep - 1e-4) continue; }   // sub-frame sliver at a cut
                         SKWord *word = [SKWord new];
                         word.srcStart = s; word.srcEnd = e; word.origStart = rw.os; word.origEnd = rw.oe; word.mediaPath = path;
                         if (!sequenceMode) { word.sourceClip = clip; word.clipOrigin = originTime; word.clipFrame = clipFrame; }
                         word.original = t;
-                        word.corrKey = rw.key;
-                        NSString *fixed = corrections[rw.key ?: [NSString stringWithFormat:@"%.3f", rw.os]];
+                        NSString *fixed = corrections[[NSString stringWithFormat:@"%.3f", rw.os]];
                         word.text = fixed ?: t;
                         word.tlStart = placed ? tlStart + MAX(s - trimStart, 0) / rate : NAN;
                         word.tlEnd = placed ? MIN(tlStart + (e - trimStart) / rate, tlStart + clipDur) : NAN;
@@ -2023,7 +2265,7 @@ static BOOL SKIsFiller(NSString *text) {
                             closeBlock();
                             NSUInteger nameStart = out.length;
                             [labels addObject:@[[NSValue valueWithRange:NSMakeRange(out.length, word.speaker.length)], word.speaker]];
-                            add([word.speaker stringByAppendingString:@"\n"], @{NSFontAttributeName: [NSFont systemFontOfSize:SKPt(11) weight:NSFontWeightSemibold],
+                            add([word.speaker stringByAppendingString:@"\n"], @{NSFontAttributeName: [NSFont systemFontOfSize:SKPt(12) weight:NSFontWeightSemibold],
                                 NSForegroundColorAttributeName: SKSpeakerTextColor(word.speaker),
                                 NSToolTipAttributeName: @"Double-click to rename this speaker everywhere; right-click to change its color"});
                             [nameParas addObject:[NSValue valueWithRange:NSMakeRange(nameStart, out.length - nameStart)]];
@@ -2061,7 +2303,7 @@ static BOOL SKIsFiller(NSString *text) {
         if (missingAssets.count) {
             if (!gTranscribeState) gTranscribeState = [NSMapTable strongToStrongObjectsMapTable];
             // Nothing starts on its own: transcribing writes into the library, so it waits for the
-            // Transcribe link below (2026-10-15).
+            // Transcribe link below.
             NSMutableArray *idleAssets = [NSMutableArray array], *idleClips = [NSMutableArray array];
             for (id a in missingAssets) if (![[gTranscribeState objectForKey:a] isEqualToString:@"running"]) [idleAssets addObject:a];
             for (id c in missingClips) for (id a in SKAssetsForItem(c)) if ([idleAssets containsObject:a]) { [idleClips addObject:c]; break; }
@@ -2075,6 +2317,19 @@ static BOOL SKIsFiller(NSString *text) {
                 else notStarted++;
             }
             NSString *(^clipsWord)(NSUInteger) = ^(NSUInteger n) { return n == 1 ? @"1 clip" : [NSString stringWithFormat:@"%lu clips", (unsigned long)n]; };
+            if (words.count == 0) {   // v110: nothing to show, so the whole area becomes the empty view
+                if (running) {
+                    emptyKindNew = 2; emptyTitleNew = @"Transcribing…";
+                    emptyBodyNew = [NSString stringWithFormat:@"Final Cut Pro's built-in transcription is reading the audio of %@. The transcript appears here when it's done. Progress: Window › Background Tasks.", clipsWord(running)];
+                } else if (failed) {
+                    emptyKindNew = 3; emptyTitleNew = @"Couldn\u2019t Transcribe"; gTranscribeLabel = @"Try Again";
+                    emptyBodyNew = [NSString stringWithFormat:@"Final Cut Pro's built-in transcription couldn't transcribe %@: %@.", clipsWord(failed), [reasons.array componentsJoinedByString:@"; "]];
+                } else {
+                    emptyKindNew = 1; emptyTitleNew = @"No Transcript"; gTranscribeLabel = @"Transcribe";
+                    emptyBodyNew = notStarted == 1 ? @"Transcribe this clip with Final Cut Pro's built-in transcription, the same as Modify › Analyze and Fix › Transcribe. The transcript is saved in your library."
+                        : [NSString stringWithFormat:@"%lu clips have no transcript yet. Transcribe them with Final Cut Pro's built-in transcription, the same as Modify › Analyze and Fix › Transcribe. The transcripts are saved in your library.", (unsigned long)notStarted];
+                }
+            } else {
             if (running) add([NSString stringWithFormat:@"Transcribing %@ with Final Cut Pro… The transcript appears here when it's done (progress: Window › Background Tasks).\n", clipsWord(running)], dim);
             if (notStarted) add([NSString stringWithFormat:@"%@ no transcript yet. ", notStarted == 1 ? @"This clip has" : [NSString stringWithFormat:@"%lu clips have", (unsigned long)notStarted]], dim);
             if (failed) add([NSString stringWithFormat:@"Couldn't transcribe %@: %@. ", clipsWord(failed), [reasons.array componentsJoinedByString:@"; "]], dim);
@@ -2087,6 +2342,7 @@ static BOOL SKIsFiller(NSString *text) {
                 gTranscribeLabel = notStarted ? @"Transcribe" : @"Try again";
                 gRetryRange = NSMakeRange(out.length, 1);
                 add(@"\u200B\n", slot);
+            }
             }
         } else if (words.count == 0) add(gSpeakerFilter ? @"Nothing from this speaker on the timeline.\n" : @"No speech in this selection.\n", dim);
         TLog(@"render: sequenceMode=%d clips=%lu shown=%lu of %lu fillers=%lu pauses=%lu (>=%.1fs) speakers=[%@] filter=%@", sequenceMode, (unsigned long)clips.count,
@@ -2111,6 +2367,7 @@ static BOOL SKIsFiller(NSString *text) {
     self.labelRanges = labels;
     self.mediaPaths = mediaPaths.array;
     self.timelineName = timelineName;
+    TLog(@"timeline name for export: %@", timelineName ?: @"(none)");
     self.proxyPaths = proxies;
     self.renderedSignature = SKTimelineSignature();
     self.renderedKey = [self sk_renderKeyWithSignature:self.renderedSignature];
@@ -2133,18 +2390,24 @@ static BOOL SKIsFiller(NSString *text) {
     }
     if (!identical) [self.textView.textStorage setAttributedString:out];
     if (!self.colorPanel) { self.colorWheelButton.hidden = YES; self.hoverSpeaker = nil; }
-    if (gRetryRange.location != NSNotFound && NSMaxRange(gRetryRange) <= out.length) {
+    if (gRetryRange.location != NSNotFound && NSMaxRange(gRetryRange) <= out.length) {   // partial case: some clips have words, some don't
         NSLayoutManager *lm = self.textView.layoutManager;
         [lm ensureLayoutForTextContainer:self.textView.textContainer];
         NSRange g = [lm glyphRangeForCharacterRange:gRetryRange actualCharacterRange:NULL];
         NSRect line = [lm lineFragmentRectForGlyphAtIndex:g.location effectiveRange:NULL];
         NSButton *b = self.transcribeButton;
+        if (b.superview != self.textView) { [self.textView addSubview:b]; b.controlSize = NSControlSizeSmall; b.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]]; b.bezelColor = nil; }
         b.title = gTranscribeLabel ?: @"Transcribe";
         [b sizeToFit];
         NSPoint o = self.textView.textContainerOrigin;
         [b setFrameOrigin:NSMakePoint(o.x - 4, o.y + NSMinY(line) + round((NSHeight(line) - NSHeight(b.frame)) / 2))];
         b.hidden = NO;
-    } else self.transcribeButton.hidden = YES;
+        [self sk_setEmptyKind:0 title:nil body:nil];
+    } else if (emptyKindNew) {
+        NSButton *b = self.transcribeButton;
+        if (b.superview != self.emptyView) { [self.emptyView addSubview:b]; b.controlSize = NSControlSizeRegular; b.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium]; b.bezelColor = [NSColor controlAccentColor]; }
+        [self sk_setEmptyKind:emptyKindNew title:emptyTitleNew body:emptyBodyNew];
+    } else { self.transcribeButton.hidden = YES; [self sk_setEmptyKind:0 title:nil body:nil]; }
     self.textView.selectedRange = sameText && NSMaxRange(keep) <= out.length ? keep : NSMakeRange(0, 0);
     if (!sameText) self.sourceMarked = NO;
     self.fillerButton.title = [NSString stringWithFormat:@"Delete %lu", (unsigned long)fillerCount];
@@ -2204,6 +2467,10 @@ static NSString *SKSpliceKitTool(NSString *name) {
         NSString *full = [[NSHomeDirectory() stringByAppendingPathComponent:dir] stringByAppendingPathComponent:name];
         if ([[NSFileManager defaultManager] isExecutableFileAtPath:full]) return full;
     }
+    // v104: a SpliceKit reinstall can leave tools/ffmpeg a symlink to itself; use Homebrew's then.
+    if ([name isEqualToString:@"ffmpeg"])
+        for (NSString *full in @[@"/opt/homebrew/bin/ffmpeg", @"/usr/local/bin/ffmpeg"])
+            if ([[NSFileManager defaultManager] isExecutableFileAtPath:full]) { TLog(@"using %@ (SpliceKit's ffmpeg is missing)", full); return full; }
     return nil;
 }
 
@@ -2665,6 +2932,7 @@ static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
         NSRect name = NSOffsetRect([lm boundingRectForGlyphRange:g inTextContainer:tv.textContainer], o.x, o.y);
         NSButton *b = self.colorWheelButton;
         [b setFrameOrigin:NSMakePoint(round(NSMaxX(name) + 6), round(NSMidY(name) - NSHeight(b.frame) / 2))];
+        b.image = SKColorDotImage(SKSpeakerColorIndex(l[1]));
         b.hidden = NO;
         self.hoverSpeaker = l[1];
         return;
@@ -2683,7 +2951,7 @@ static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
     NSTextView *tv = self.textView;
     if (!tv.window) return;
     NSPoint screen = [tv.window convertPointToScreen:[tv convertPoint:anchor toView:nil]];
-    CGFloat W = kSKPickerPad * 2 + kSKSwatch * 2 + kSKPickerArrow, H = kSKPickerPad * 2 + kSKSwatchH * 9;
+    CGFloat W = kSKPickerPad * 2 + kSKSwatch * kSKPickerCols + kSKPickerArrow, H = kSKPickerPad * 2 + kSKSwatchH * kSKPickerRows;
     NSRect fr = NSMakeRect(screen.x - W, screen.y - H / 2, W, H);
     NSRect vis = (tv.window.screen ?: [NSScreen mainScreen]).visibleFrame;
     fr.origin.y = MAX(NSMinY(vis) + 4, MIN(fr.origin.y, NSMaxY(vis) - H - 4));
@@ -2810,7 +3078,8 @@ static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
             else if ([v isKindOfClass:[NSNumber class]] && ([v isEqual:@0] || [v isEqual:@1]) && ![k containsString:@"Mode"]) options[k] = @NO;
         }
         options[@"analyzeAndOptimizeShouldTranscribe"] = @YES;
-        NSString *lang = [defaults[@"analyzeAndOptimizeTranscriptionLanguage"] isKindOfClass:[NSString class]] ? defaults[@"analyzeAndOptimizeTranscriptionLanguage"] : @"en-US";
+        NSString *lang = self.languagePopup.selectedItem.representedObject
+            ?: ([defaults[@"analyzeAndOptimizeTranscriptionLanguage"] isKindOfClass:[NSString class]] ? defaults[@"analyzeAndOptimizeTranscriptionLanguage"] : @"en-US");
         options[@"analyzeAndOptimizeTranscriptionLanguage"] = lang;
         ((void(*)(id,SEL,id,id))objc_msgSend)(vc, NSSelectorFromString(@"analyzeAndOptimizeClips:options:"), todo, options);
         TLog(@"transcribe: Analyze and Fix (%@) for %@ options %@", lang, [todo valueForKey:@"displayName"], options);
@@ -2850,10 +3119,28 @@ static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
     if (self.highlighted.location != NSNotFound && NSMaxRange(self.highlighted) <= ts.length)
         [ts removeAttribute:NSBackgroundColorAttributeName range:self.highlighted];
     if (range.location != NSNotFound && NSMaxRange(range) <= ts.length) {
-        [ts addAttribute:NSBackgroundColorAttributeName value:[[NSColor colorWithSRGBRed:0.30 green:0.55 blue:1.0 alpha:1] colorWithAlphaComponent:0.32] range:range];
-        if (self.textView.selectedRange.length == 0) [self.textView scrollRangeToVisible:range];
+        [ts addAttribute:NSBackgroundColorAttributeName value:[NSColor colorWithSRGBRed:0x3E/255.0 green:0x4D/255.0 blue:0x73/255.0 alpha:1] range:range];   // v118: FCP's slate-blue
+        if (self.textView.selectedRange.length == 0) [self sk_scrollPlayheadWordIntoView:range];
     }
     self.highlighted = range;
+}
+
+// Keep the playhead word on screen. When it is off screen (on open, or when playback runs off
+// the bottom), put it a quarter of the way down the panel instead of centring it (v92).
+- (void)sk_scrollPlayheadWordIntoView:(NSRange)range {
+    NSTextView *tv = self.textView;
+    NSLayoutManager *lm = tv.layoutManager;
+    if (!lm || !tv.textContainer) { [tv scrollRangeToVisible:range]; return; }
+    [lm ensureLayoutForCharacterRange:range];
+    NSRange g = [lm glyphRangeForCharacterRange:range actualCharacterRange:NULL];
+    NSRect r = [lm boundingRectForGlyphRange:g inTextContainer:tv.textContainer];
+    r = NSOffsetRect(r, tv.textContainerOrigin.x, tv.textContainerOrigin.y);
+    NSRect vis = tv.visibleRect;
+    if (NSHeight(vis) <= 0) return;
+    if (NSMinY(r) >= NSMinY(vis) && NSMaxY(r) <= NSMaxY(vis)) return;   // already visible
+    CGFloat y = NSMinY(r) - NSHeight(vis) * 0.25;
+    y = MAX(0, MIN(y, NSHeight(tv.bounds) - NSHeight(vis)));
+    [tv scrollPoint:NSMakePoint(NSMinX(vis), y)];
 }
 
 // Cheap fingerprint of the primary storyline: which clips, where, and how they are trimmed.
@@ -2872,7 +3159,25 @@ static NSString *SKTimelineSignature(void) {
 
 // Highlight the last timeline word that starts at or before the playhead, and redraw when
 // the timeline was edited outside this tab (blade, trim, undo, appended clips…).
+- (void)sk_syncFooterHost {
+    id tm = gTabModule;
+    NSView *fav = tm && [tm respondsToSelector:NSSelectorFromString(@"moduleFooterAccessoryView")] ? [tm valueForKey:@"moduleFooterAccessoryView"] : nil;
+    NSView *host = self.footerHost;
+    if (!fav || !host) return;
+    if (host.superview != fav) {
+        [host removeFromSuperview];
+        host.frame = fav.bounds;
+        [fav addSubview:host];
+        TLog(@"footer: help + Export placed in FCP's footer bar %@", NSStringFromRect(fav.bounds));
+    }
+    CGFloat W = NSWidth(host.bounds);
+    NSRect f = NSMakeRect(26, 0, MAX(0, W - 26 - 29), NSHeight(host.bounds));
+    if (!NSEqualRects(self.footerStack.frame, f)) self.footerStack.frame = f;
+    BOOL show = [(SKFooterHost *)host sk_shouldShow];
+    if (self.footerStack.hidden == show) { self.footerStack.hidden = !show; }
+}
 - (void)sk_tick {
+    [self sk_syncFooterHost];
     if (self.tickCount % 3 == 0) [self sk_reattachIfNeeded];
     if (![self sk_isShowing]) { self.tickCount++; return; }
     if (self.needsRefresh) { [self sk_refresh]; return; }
@@ -3024,7 +3329,7 @@ static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead, CMTim
     }
     id ranged = ((id(*)(id,SEL,CMTimeRange,id))objc_msgSend)(rao, NSSelectorFromString(@"rangeAndObjectWithRange:andObject:"), range, browserObject);
     BOOL ok = NO;
-    // List view: _selectMediaRanges: and the list's selectArbitraryRange: match the range to
+    // List view (v93): _selectMediaRanges: and the list's selectArbitraryRange: match the range to
     // rows in the list (whole clips, keyword/favorite sub-rows), so a range inside a clip selects the
     // wrong rows or nothing. Set In and Out instead, the way the I and O keys do (clip time; O marks
     // through the end of the frame it is given, so give it the last frame).
@@ -3035,7 +3340,7 @@ static BOOL SKRevealInBrowser(id clip, CMTimeRange range, CMTime playhead, CMTim
     if (ranged && list && [list respondsToSelector:inSel] && [list respondsToSelector:outSel]) {
         // Clear the clip's existing marks first (Option-X); list view keeps several ranges per clip.
         // Then the playhead: In/Out act on the clip under the strip's playhead.
-        // FCP can throw inside these calls (e.g. an unrecognized selector in
+        // v100: FCP can throw inside these calls (e.g. an unrecognized selector in
         // -[FFOrganizerFilmstripView _conformArray:toBaseRangesMapTable:] under
         // setSelectionStartTime:), and an exception that reaches FCP's run loop aborts the app.
         // Catch it here: the marks may be left unset, but FCP keeps running.
@@ -3141,7 +3446,7 @@ static id SKClipAtTime(double t);
     CMTime s = SKClipTime(a, a.srcStart, -1), e = SKClipTime(b, b.srcEnd, 1);
     NSString *clipName = nil; @try { clipName = [a.sourceClip valueForKey:@"displayName"]; } @catch (id x) {}
     TLog(@"mark source '%@'…'%@' media %.3f–%.3f in '%@' (%@ %p)", a.text, b.text, a.srcStart, b.srcEnd, clipName, [a.sourceClip class], a.sourceClip);
-    @try {   // Never let an FCP exception from the browser calls reach its run loop (it aborts)
+    @try {   // v100: never let an FCP exception from the browser calls reach its run loop (it aborts)
         self.sourceMarked = SKRevealInBrowser(a.sourceClip, CMTimeRangeFromTimeToTime(s, e), s, a.clipFrame);
     } @catch (NSException *ex) {
         TLog(@"mark source threw %@: %@", ex.name, ex.reason);
@@ -3357,7 +3662,7 @@ static NSString *SKClockMS(double t) {
     for (SKWord *w in self.allItems) {
         if (w.pause) { flush(); continue; }
         if (isnan(w.tlStart) || w.text.length == 0) continue;
-        if (w.filler) continue;   // v82: Parakeet's um/uh stay out of captions (FCP's text never had them)
+        if (w.filler) continue;   // um/uh stay out of captions
         if (w.speaker && lastSpeaker && ![w.speaker isEqualToString:lastSpeaker]) flush();
         lastSpeaker = w.speaker ?: lastSpeaker;
         NSUInteger len = 0; for (SKWord *c in cur) len += c.text.length + 1;
@@ -3419,6 +3724,19 @@ static NSString *SKClockMS(double t) {
 // Captions with it. The import's open panel is answered by SKOpenPanel* hooks below (it never
 // appears), so FCP parses, places and adds the captions itself, as one undoable step.
 static NSURL *gPendingCaptionURL;
+// MANUAL.html sits next to the dylib (install.sh puts it there).
+- (void)sk_openManual:(id)sender {
+    @try {
+        Dl_info info; NSString *dir = nil;
+        if (dladdr((const void *)SKAlignWordsWithCTC, &info) && info.dli_fname) dir = [[NSString stringWithUTF8String:info.dli_fname] stringByDeletingLastPathComponent];
+        if (!dir.length) dir = [@"~/Library/Application Support/SpliceKit/plugins/com.innerparakeet.transcript-tab" stringByExpandingTildeInPath];
+        NSString *path = [dir stringByAppendingPathComponent:@"MANUAL.html"];
+        if (![NSFileManager.defaultManager isReadableFileAtPath:path]) { TLog(@"manual not found at %@", path); NSBeep(); return; }
+        TLog(@"opening manual %@", path);
+        [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:path]];
+    } @catch (NSException *e) { TLog(@"openManual threw %@", e.reason); }
+}
+
 - (BOOL)sk_createCaptions:(id)sender {
     NSString *srt = [self sk_srt];
     if (srt.length == 0) { NSBeep(); return NO; }
@@ -3438,7 +3756,7 @@ static NSURL *gPendingCaptionURL;
 // survive re-renders and restarts. An empty correction hides a word (used when a replacement
 // merges several words into one, e.g. "sound bite" -> "soundbite").
 
-static NSString *SKCorrectionKey(SKWord *w) { return w.corrKey ?: [NSString stringWithFormat:@"%.3f", w.origStart]; }
+static NSString *SKCorrectionKey(SKWord *w) { return [NSString stringWithFormat:@"%.3f", w.origStart]; }
 
 static NSMutableDictionary *SKCorrections(NSString *path, BOOL create) {
     NSMutableDictionary *entry = SKSpeakerEntry(path, create);
@@ -3805,7 +4123,12 @@ static id SKClipAtTime(double t) {
     for (SKWord *w in self.words) {
         if (isnan(w.tlStart) || w.connectedClip || (fillers ? !w.filler : !w.pause)) continue;   // primary storyline only
         CMTimeRange r = [self sk_cutRangeFrom:w to:w];
-        if (!CMTIMERANGE_IS_VALID(r)) continue;
+        if (!CMTIMERANGE_IS_VALID(r)) {
+            NSUInteger i = [self.allItems indexOfObject:w];
+            SKWord *nx = i + 1 < self.allItems.count ? self.allItems[i + 1] : nil;
+            TLog(@"bulk delete: skipped '%@' %.3f-%.3f (src %.3f-%.3f), next '%@' at %.3f: less than a frame", w.text, w.tlStart, w.tlEnd, w.srcStart, w.srcEnd, nx.text, nx.tlStart);
+            continue;
+        }
         if (CMTIMERANGE_IS_VALID(prev) && CMTimeCompare(r.start, CMTimeRangeGetEnd(prev)) <= 0) {   // touching: merge
             prev = CMTimeRangeFromTimeToTime(prev.start, CMTimeRangeGetEnd(r));
             [ranges removeLastObject];
@@ -4090,6 +4413,17 @@ static void SKInstallBrowseHook(void) {
         TLog(@"test transcribe: button %@", gModule.transcribeButton.hidden ? @"hidden" : @"clicked");
         if (!gModule.transcribeButton.hidden) [gModule.transcribeButton performClick:nil];
     }];
+    // SKTranscriptTestLanguage "fr-FR" (v104): pick that Transcript › Language item, as a click would.
+    [nc addObserverForName:@"SKTranscriptTestLanguage" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
+        NSString *want = [n.object description];
+        for (NSMenuItem *it in gModule.languagePopup.itemArray) if ([it.representedObject isEqualToString:want]) {
+            [gModule.languagePopup selectItem:it];
+            [gModule sk_languageChanged:gModule.languagePopup];
+            TLog(@"test language: %@ (%@), %lu choices", want, it.title, (unsigned long)gModule.languagePopup.numberOfItems);
+            return;
+        }
+        TLog(@"test language: %@ not in the list (%lu choices)", want, (unsigned long)gModule.languagePopup.numberOfItems);
+    }];
     [nc addObserverForName:@"SKTranscriptTestBrowse" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n) {
         NSString *(^norm)(NSString *) = ^(NSString *x) {
             return [[[x lowercaseString] componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@""];
@@ -4146,5 +4480,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.3.2 loaded");
+    TLog(@"Transcript Tab 1.4.0 loaded");
 }

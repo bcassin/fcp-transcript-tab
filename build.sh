@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 VERSION=$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')
 mkdir -p build dist
 clang -arch arm64 -arch x86_64 -mmacosx-version-min=14.0 -dynamiclib -fobjc-arc \
-      -framework AppKit -framework CoreMedia -Wl,-undefined,dynamic_lookup \
+      -framework AppKit -framework CoreMedia -framework NaturalLanguage -Wl,-undefined,dynamic_lookup \
       -o build/TranscriptTab.dylib TranscriptTab.m
 codesign -s - -f build/TranscriptTab.dylib
 # ctcalign: the word aligner Detect runs (CoreML only; uses the Parakeet CTC model FluidAudio keeps
@@ -16,7 +16,9 @@ codesign -s - -f build/ctcalign
 # The zip holds the plugin folder exactly as it goes into SpliceKit's plugins folder.
 STAGE=build/stage/com.innerparakeet.transcript-tab
 rm -rf build/stage && mkdir -p "$STAGE"
-cp build/TranscriptTab.dylib build/ctcalign plugin.json "$STAGE/"
+# The manual the footer "?" button opens (built from docs/MANUAL.md).
+python3 tools/manual_to_html.py docs/MANUAL.md docs/MANUAL.html
+cp build/TranscriptTab.dylib build/ctcalign plugin.json docs/MANUAL.html "$STAGE/"
 rm -f "dist/TranscriptTab-$VERSION.zip"
 (cd build/stage && zip -qr "../../dist/TranscriptTab-$VERSION.zip" com.innerparakeet.transcript-tab)
 echo "Built dist/TranscriptTab-$VERSION.zip"

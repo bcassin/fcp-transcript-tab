@@ -245,6 +245,8 @@ Because corrections are keyed to the original word, they survive Re-detect.
 
 Exports from timeline view use timeline times; from source view they use the clip's own times.
 
+**Copy instead of export.** Select text in the panel and press **Cmd-C** (or right-click › Copy) to put it on the clipboard as plain text, ready to paste into an email or a document. With nothing selected, Cmd-C copies the whole transcript; **Cmd-A** selects all of it. A speaker's name is included when it is part of your selection, on its own line. Timecodes and pauses are left out, your corrections are kept, and the panel's line breaks at cuts are joined so sentences read normally.
+
 ---
 
 ## Keys at a glance
@@ -256,6 +258,8 @@ Exports from timeline view use timeline times; from source view they use the cli
 | **E / W / D / Q** | Append / Insert / Overwrite / Connect the marked range (source view) |
 | **Delete** | Ripple delete the selected words (timeline view) |
 | **Shift-Delete** | Lift the selected words, leaving a gap |
+| **Cmd-C** | Copy the selected text (or the whole transcript) as plain text |
+| **Cmd-A** | Select the whole transcript |
 | **Cmd-F** | Find |
 | **Return** / double-click | Correct a word |
 | **Tab** (editing) | Save and go to the next word |

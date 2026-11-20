@@ -225,6 +225,8 @@ static CMTimeRange SKTimeRange(id obj) {
 - (void)sk_detectSpeakers:(id)sender;
 - (BOOL)sk_assignSpeaker:(NSString *)name;
 - (NSArray<SKWord *> *)sk_selectedSpokenWords;
+- (NSString *)sk_copyText;
+- (BOOL)sk_copyToPasteboard;
 - (NSMenu *)sk_contextMenuAtIndex:(NSUInteger)idx;
 - (BOOL)sk_renameSpeaker:(NSString *)old to:(NSString *)new;
 - (void)sk_beginEditingWord:(SKWord *)w;
@@ -1333,12 +1335,27 @@ static const int kSKPickerCols = 4, kSKPickerRows = 2;
 - (BOOL)performKeyEquivalent:(NSEvent *)event {
     if (self.window.firstResponder == self && (event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) == NSEventModifierFlagCommand
         && [event.charactersIgnoringModifiers isEqualToString:@"f"]) { [self.module sk_focusSearch]; return YES; }
+    // Cmd-C copies the transcript text (FCP's Edit › Copy would copy timeline clips);
+    // Cmd-A selects the whole transcript.
+    if (self.window.firstResponder == self && (event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask) == NSEventModifierFlagCommand) {
+        NSString *k = event.charactersIgnoringModifiers.lowercaseString;
+        if ([k isEqualToString:@"c"]) { if (![self.module sk_copyToPasteboard]) NSBeep(); return YES; }
+        if ([k isEqualToString:@"a"]) { self.selectedRange = NSMakeRange(0, self.textStorage.length); return YES; }
+    }
     return [super performKeyEquivalent:event];
+}
+
+- (void)copy:(id)sender { if (![self.module sk_copyToPasteboard]) NSBeep(); }
+
+- (BOOL)validateMenuItem:(NSMenuItem *)item {
+    if (item.action == @selector(copy:)) return [self.module sk_copyText].length > 0;
+    return [super validateMenuItem:item];
 }
 
 - (void)keyDown:(NSEvent *)event {
     if ((event.keyCode == 36 || event.keyCode == 76) && self.selectedRange.length > 0) {   // Return: correct the selected word
-        [self.module sk_beginEditingWord:[self.module sk_wordAtIndex:self.selectedRange.location]];
+        SKWord *w = [self.module sk_selectedSpokenWords].firstObject ?: [self.module sk_wordAtIndex:self.selectedRange.location];   // the selection may start on a speaker name
+        [self.module sk_beginEditingWord:w];
         return;
     }
     BOOL isDelete = event.keyCode == 51 || event.keyCode == 117;
@@ -1705,6 +1722,7 @@ static const int kSKPickerCols = 4, kSKPickerRows = 2;
         SKInspectorModuleTranscript *m = weakSelf;
         NSString *cmd = [n.object description];
         if ([cmd isEqualToString:@"captions"]) { TLog(@"test captions ok=%d", [m sk_createCaptions:nil]); return; }
+        if ([cmd isEqualToString:@"copy"]) { TLog(@"test copy ok=%d", [m sk_copyToPasteboard]); return; }
         NSRange colon = [cmd rangeOfString:@":"];
         if (colon.location == NSNotFound) return;
         NSInteger kind = [@[@"txt", @"tc", @"srt", @"premiere", @"speakers"] indexOfObject:[cmd substringToIndex:colon.location]];
@@ -2802,6 +2820,60 @@ static NSArray *SKKeepSpeakerIDs(NSArray *old, NSArray *fresh) {
 
 // Label the selected words as `name`, per media file, in source time.
 // Spoken words in the text selection, from the timeline or a browser clip.
+// Text for Copy — the selected words (or the whole transcript when nothing is selected)
+// with a speaker name line at each change of speaker, a blank line between paragraphs, no
+// timecodes and no pause capsules. Corrections are included (word.text).
+- (NSString *)sk_copyText {
+    NSRange sel = self.textView.selectedRange;
+    BOOL whole = sel.length == 0;
+    NSMutableString *out = [NSMutableString string];
+    NSString *lastSpeaker = nil;
+    BOOL lineOpen = NO;
+    NSUInteger prevEnd = 0;
+    for (SKWord *w in self.words) {
+        if (w.pause || w.range.location == NSNotFound || w.text.length == 0) continue;
+        if (!whole && NSIntersectionRange(sel, w.range).length == 0) continue;
+        BOOL newSpeaker = w.speaker && ![w.speaker isEqualToString:lastSpeaker];
+        // The name goes in only if its label (between the previous copied word and this one)
+        // is part of the selection.
+        BOOL nameSelected = whole;
+        if (newSpeaker && !whole)
+            for (NSArray *l in self.labelRanges) {
+                NSRange r = [l[0] rangeValue];
+                if (r.location >= prevEnd && r.location < w.range.location && NSIntersectionRange(r, sel).length) { nameSelected = YES; break; }
+            }
+        prevEnd = NSMaxRange(w.range);
+        if (newSpeaker && !nameSelected) {
+            if (out.length && lineOpen) { [out appendString:@"\n\n"]; lineOpen = NO; }   // still a new paragraph
+            lastSpeaker = w.speaker;
+        } else if (newSpeaker) {
+            if (out.length) [out appendString:lineOpen ? @"\n\n" : @"\n"];
+            [out appendFormat:@"%@\n", w.speaker];
+            lastSpeaker = w.speaker; lineOpen = NO;
+        } else if (w.paragraphStart && lineOpen) {
+            // The panel starts a line at every cut; in the copy, a new paragraph only after a
+            // sentence end, otherwise the sentence carries on (like the by-speaker export).
+            unichar c = [out characterAtIndex:out.length - 1];
+            if (c == '.' || c == '?' || c == '!') { [out appendString:@"\n\n"]; lineOpen = NO; }
+        }
+        if (lineOpen) [out appendString:@" "];
+        [out appendString:w.text];
+        lineOpen = YES;
+    }
+    if (lineOpen) [out appendString:@"\n"];
+    return out;
+}
+
+- (BOOL)sk_copyToPasteboard {
+    NSString *s = [self sk_copyText];
+    TLog(@"copy: %lu chars (%@)", (unsigned long)s.length, self.textView.selectedRange.length ? @"selection" : @"whole transcript");
+    if (s.length == 0) return NO;
+    NSPasteboard *pb = [NSPasteboard generalPasteboard];
+    [pb clearContents];
+    [pb setString:s forType:NSPasteboardTypeString];
+    return YES;
+}
+
 - (NSArray<SKWord *> *)sk_selectedSpokenWords {
     NSRange sel = self.textView.selectedRange;
     NSMutableArray *hit = [NSMutableArray array];
@@ -3429,6 +3501,20 @@ static id SKClipAtTime(double t);
         BOOL ok = ((BOOL(*)(id,SEL))objc_msgSend)(tl, NSSelectorFromString(@"timelineHasSelectedRange"));
         TLog(@"mark timeline '%@'…'%@' %.3f–%.3f -> %@", a.text ?: @"pause", b.text ?: @"pause", CMTimeGetSeconds(s), CMTimeGetSeconds(e), ok ? @"range set" : @"no range");
         [self.textView.window makeFirstResponder:self.textView];   // keep Delete / key forwarding working on the text selection
+        // When the range lands on another clip, FCP changes its selection a moment later and
+        // moves focus to the timeline, so Cmd-C / Delete would go to FCP. Take focus back while
+        // the text selection is unchanged.
+        NSTextView *tv = self.textView;
+        for (NSNumber *delay in @[@0.15, @0.5, @1.0]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                NSWindow *w = tv.window;
+                if (!w || !NSEqualRanges(tv.selectedRange, sel) || w.firstResponder == tv) return;
+                if ([w.firstResponder isKindOfClass:[NSText class]]) return;   // typing in a field
+                if (NSEvent.pressedMouseButtons) return;
+                TLog(@"focus taken back from %@ after timeline mark", NSStringFromClass([w.firstResponder class]));
+                [w makeFirstResponder:tv];
+            });
+        }
         return ok;
     } @catch (id ex) { TLog(@"mark timeline threw %@", ex); return NO; }
 }
@@ -3982,6 +4068,12 @@ static NSMutableDictionary *SKCorrections(NSString *path, BOOL create) {
     NSArray<SKWord *> *hit = [self sk_selectedWords];
     if (hit.count == 0) return;
     NSUInteger start = hit.firstObject.range.location;
+    // A drag that starts on a speaker name keeps the name selected (so Copy includes it).
+    NSRange sel = self.textView.selectedRange;
+    for (NSArray *l in self.labelRanges) {
+        NSRange r = [l[0] rangeValue];
+        if (r.location < start && NSIntersectionRange(r, sel).length) { start = r.location; break; }
+    }
     self.textView.selectedRange = NSMakeRange(start, NSMaxRange(hit.lastObject.range) - start);
 }
 
@@ -4480,5 +4572,5 @@ __attribute__((constructor)) static void tab_init(void) {
     o_panelURLs = SKOverride(op, @selector(URLs), (IMP)h_panelURLs);
     SKInstallInspectorRestore();
     SKInstallBrowseHook();
-    TLog(@"Transcript Tab 1.4.0 loaded");
+    TLog(@"Transcript Tab 1.5.0 loaded");
 }
